@@ -45,6 +45,7 @@ New environment → iDrive version → car model → required files → paramete
   coding, vehicle services) kept outside the system images.
 * **Virtual controller**: rotor, push, tilt and buttons on screen and on the keyboard; mouse as touch screen.
 * **Virtual car**: CAN signals, scenarios, record/replay and a TCP server; GPS with NMEA/UBX output and GPX routes; cluster and HUD views (iDrive 5/6).
+* **Rear-view camera**: your computer's webcam is shown over the display when reverse is engaged on the virtual CAN bus, with parking guide lines (see [docs/CAMERA.md](docs/CAMERA.md)). Host-side overlay: the emulated HMI does not receive the video.
 * **Your own car from its VIN**: the type key (VIN characters 4–7) is decoded with the KIS database of your PSdZData into chassis, body, engine, model year,
   market and iDrive generation, and the new environment is set up to match. iDrive 5/6 head units can be **Navigation Professional**, **Business** or **EntryNav**.
 * **System files, unpacked**: one click extracts the SWFL/HAR packages (or the built image) into normal files you can browse in the app or open in Finder.
