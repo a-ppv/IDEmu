@@ -18,6 +18,22 @@ All releases: [Releases](https://github.com/herrbimmer/IDEmu/releases). The pack
 * **Windows:** unzip, double-click `IDEmu.bat` (Python is bundled; you need a GPU driver with OpenGL, see [docs/WINDOWS.md](docs/WINDOWS.md)).
 * **macOS (Apple Silicon):** unzip, then once: `brew install glib pixman gnutls libpng libslirp zstd` and `xattr -dr com.apple.quarantine .`, then run `./IDEmu.command` (or `python3 -m idemu gui`).
 
+### Suggested minimum system requirements
+
+These are suggestions taken from how the emulator is built and from the Windows tests in [docs/WINDOWS.md](docs/WINDOWS.md), not a formal benchmark.
+
+| | macOS | Windows |
+|---|---|---|
+| **OS** | macOS 14 or later | Windows 10 (1803+) or 11, 64-bit |
+| **CPU** | Apple Silicon (M1 or newer); Intel Macs are not supported by the packaged build | 64-bit x86 with 4 or more cores (the VMs run in software emulation) |
+| **RAM** | 8 GB for iDrive 5/6 and CIC; 16 GB for iDrive 7 and 8 | 8 GB for iDrive 5/6 and CIC; 16 GB plus a large page file for iDrive 7; **32 GB recommended for iDrive 8** (it commits 12 GiB) |
+| **Disk (free)** | 20 GB (images and environments are built from your own firmware) | 20 GB, on an SSD; exclude the IDEmu folder from Defender for iDrive 7 |
+| **Graphics** | Any Mac GPU (Metal) | A GPU driver with OpenGL (4.1 core for iDrive 7); iDrive 8 also needs Edge or Chrome for ANGLE |
+| **Other** | Python 3 and the Homebrew libraries listed above | Nothing else: Python is bundled in the zip |
+| **Speed** | iDrive 8 runs near native speed (HVF) | iDrive 8 runs in TCG: minutes to boot and a slow interface; iDrive 5/6 boots in ~25-45 s |
+
+You always need your own BMW firmware packages (PSdZData); none are included.
+
 ## Supported systems
 
 | System | Hardware / OS emulated | Level* | What works | What does not (yet) |

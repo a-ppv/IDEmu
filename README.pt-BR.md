@@ -16,6 +16,22 @@ Todas as versões em [Releases](https://github.com/herrbimmer/IDEmu/releases). O
 * **Windows:** extraia e dê dois cliques em `IDEmu.bat` (o Python já vem junto; precisa de driver de vídeo com OpenGL, veja [docs/WINDOWS.md](docs/WINDOWS.md)).
 * **macOS (Apple Silicon):** extraia e, uma vez: `brew install glib pixman gnutls libpng libslirp zstd` e `xattr -dr com.apple.quarantine .`; depois `./IDEmu.command` (ou `python3 -m idemu gui`).
 
+### Requisitos mínimos de sistema (sugestão)
+
+São sugestões baseadas em como o emulador é construído e nos testes em Windows de [docs/WINDOWS.md](docs/WINDOWS.md), não um benchmark formal.
+
+| | macOS | Windows |
+|---|---|---|
+| **Sistema** | macOS 14 ou mais novo | Windows 10 (1803+) ou 11, 64 bits |
+| **CPU** | Apple Silicon (M1 ou mais novo); Macs Intel não são suportados pelo pacote pronto | x86 de 64 bits com 4 ou mais núcleos (as VMs rodam em emulação por software) |
+| **RAM** | 8 GB para iDrive 5/6 e CIC; 16 GB para iDrive 7 e 8 | 8 GB para iDrive 5/6 e CIC; 16 GB mais um arquivo de paginação grande para o iDrive 7; **32 GB recomendados para o iDrive 8** (ele compromete 12 GiB) |
+| **Disco livre** | 20 GB (imagens e ambientes são gerados a partir do seu firmware) | 20 GB, em SSD; exclua a pasta do IDEmu do Defender para o iDrive 7 |
+| **Vídeo** | Qualquer GPU de Mac (Metal) | Driver de vídeo com OpenGL (4.1 core no iDrive 7); o iDrive 8 também precisa do Edge ou Chrome (ANGLE) |
+| **Outros** | Python 3 e as bibliotecas do Homebrew listadas acima | Nada: o Python já vem no zip |
+| **Velocidade** | O iDrive 8 roda quase nativo (HVF) | O iDrive 8 roda em TCG: boot de minutos e interface lenta; o iDrive 5/6 sobe em ~25-45 s |
+
+Você sempre precisa dos seus próprios pacotes de firmware da BMW (PSdZData); nenhum vem incluído.
+
 ## Uso rápido
 
 ```bash
