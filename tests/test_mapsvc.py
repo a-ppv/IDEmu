@@ -1,3 +1,5 @@
+import os as _os, unittest as _ut
+if _os.name == 'nt': raise _ut.SkipTest('usa sockets unix (macOS/Linux)')
 """Serviço de mapa: pedidos de bloco, cache e fonte desligada, sem rede externa (servidor HTTP local)."""
 import http.server, json, os, socket, sys, tempfile, threading, time, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

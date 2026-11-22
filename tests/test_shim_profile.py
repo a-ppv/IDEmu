@@ -1,4 +1,4 @@
-"""Tests for fail-closed selection of fixed-address HMI shim profiles."""
+﻿"""Tests for fail-closed selection of fixed-address HMI shim profiles."""
 import unittest
 
 from idemu import builder
@@ -12,9 +12,9 @@ def firmware_hashes(profile):
 
 class ShimProfileTest(unittest.TestCase):
     def test_default_and_profile_directories_are_separate(self):
-        self.assertTrue(builder.shim_libdir({}).endswith("/shim/lib"))
-        self.assertTrue(builder.shim_libdir({"shim_profile": "default"}).endswith("/shim/lib"))
-        self.assertTrue(builder.shim_libdir({"shim_profile": "1803"}).endswith("/shim/lib-1803"))
+        self.assertTrue(builder.shim_libdir({}).replace("\\", "/").endswith("/shim/lib"))
+        self.assertTrue(builder.shim_libdir({"shim_profile": "default"}).replace("\\", "/").endswith("/shim/lib"))
+        self.assertTrue(builder.shim_libdir({"shim_profile": "1803"}).replace("\\", "/").endswith("/shim/lib-1803"))
 
     def test_profile_name_cannot_escape(self):
         with self.assertRaises(builder.BuildError):

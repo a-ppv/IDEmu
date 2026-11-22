@@ -1,8 +1,10 @@
 """iDrive 7 (MGU, x86-64 Linux): monta a raiz do RSE a partir da PSdZData e roda QEMU x86-64 (TCG) + glhost7.
 O HMI do banco traseiro (HmiMain3D, RSE_HIGH_LEFT) desenha pela ponte GL (ttyS1) e recebe toque pela serial ttyS0 (idemu-wl -> wl_pointer). Detalhes em docs/OUTRAS_GERACOES.md (parte 6)."""
 import glob, mmap, os, re, shutil, socket, struct, subprocess, sys, threading, time, zlib
-from . import runtime, coding7
+from . import runtime, coding7, ipc
 
+IS_WIN = ipc.IS_WIN                  # Windows nativo: QEMU/glhost7 por TCP em 127.0.0.1, memória compartilhada nomeada, imagem com symlinks/modos num sidecar (ver docs/WINDOWS.md)
+EXE = runtime.EXE                    # '.exe' no Windows
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, 'tools', 'mgu')
 GUEST = os.path.join(ROOT, 'idemu', 'guest7')
@@ -48,7 +50,62 @@ def image_ready():
     if not (os.path.isfile(OUT + '/root.img') and os.path.isfile(OUT + '/bzImage')): return False
     try: return open(OUT + '/stamp').read().strip() == guest_stamp()
     except OSError: return False
-def glhost_path(): return os.path.join(ROOT, 'bin', 'glhost7')
+def glhost_path(): return os.path.join(ROOT, 'bin', 'glhost7' + EXE)
+
+# ---------- Windows: ferramentas filhas em UTF-8, nomes de memória compartilhada, raiz do firmware com sidecar ----------
+def _py():
+    """Interpretador dos scripts de tools/mgu. No Windows em UTF-8 (`-X utf8`): o `-I` ignora PYTHONUTF8 e a saída do filho viria em cp1252, que o `text=True` do pai (UTF-8) não decodificaria."""
+    return [sys.executable, '-X', 'utf8', '-I'] if IS_WIN else [sys.executable, '-I']
+def _run(cmd):
+    """subprocess.run com a saída capturada em texto; no Windows sem janela de console e com decodificação tolerante."""
+    if IS_WIN: return subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=0x08000000)       # CREATE_NO_WINDOW
+    return subprocess.run(cmd, capture_output=True, text=True)
+def shm_win_name(name):
+    """shm-name do idemu-shm ('/idemu-gl-123') -> nome do mapeamento nomeado do Windows ('Local\\idemu-gl-123'), o mesmo que o QEMU (idemu-shm.c) e o glhost7 (winport7.h) usam."""
+    return 'Local\\' + name.lstrip('/')
+_RM = []
+def _rootmeta():
+    """tools/mgu/rootmeta.py (sidecar de symlinks e modos da raiz extraída no Windows), carregado por caminho: tools/mgu não é um pacote."""
+    if not _RM:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('idemu_rootmeta', os.path.join(TOOLS, 'rootmeta.py'))
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); _RM.append(m)
+    return _RM[0]
+def _rmtree(p):
+    """shutil.rmtree que não falha nos caminhos longos do firmware (Windows) e não deixa a pasta de trabalho para trás."""
+    shutil.rmtree(_rootmeta().lp(p) if IS_WIN else p, ignore_errors=True)
+# O overlay (tools/mgu/rse_overlay) tem dois symlinks que um checkout do Windows (ZIP, core.symlinks=false) vira arquivo de texto com o destino dentro: são
+# registrados no sidecar em vez de copiados. E os scripts com bit de execução (o Windows não guarda modo).
+WIN_OVERLAY_LINKS = {'etc/systemd/system/winston.service': '/dev/null',
+                     'etc/systemd/system/multi-user.target.wants/idemu-diag.service': '/lib/systemd/system/idemu-diag.service'}
+WIN_OVERLAY_EXEC = ('idemu-tty', 'usr/bin/idemu-diag.sh')
+def _put(root, wm, rel, src, mode=None, text=False):
+    """Copia `src` para <root>/<rel>. POSIX (wm=None): makedirs + shutil.copy (+ chmod), como sempre. Windows: segue os symlinks do sidecar (um arquivo
+    gravado em `lib/x.so` com `lib -> usr/lib` vai para `usr/lib/x.so`, como no Linux), grava LF nos textos e anota o modo no sidecar."""
+    if wm is not None: rel = wm.resolve(rel)
+    d = os.path.join(root, rel); os.makedirs(os.path.dirname(d), exist_ok=True)
+    if wm is None:
+        shutil.copy(src, d)
+        if mode is not None: os.chmod(d, mode)
+        return
+    with open(src, 'rb') as f: data = f.read()
+    if text and b'\0' not in data[:4096]: data = data.replace(b'\r\n', b'\n')       # o guest é Linux: `#!/bin/sh\r` não executa
+    with open(d, 'wb') as f: f.write(data)
+    wm.set_mode(rel, 0o644 if mode is None else mode)
+def _win_overlay(root, wm):
+    """Windows: o equivalente de shutil.copytree(rse_overlay, root, symlinks=True, dirs_exist_ok=True) com o sidecar."""
+    ov = os.path.join(TOOLS, 'rse_overlay')
+    for dp, dn, fn in os.walk(ov):
+        for f in sorted(fn):
+            s = os.path.join(dp, f); rel = os.path.relpath(s, ov).replace(os.sep, '/')
+            if rel in WIN_OVERLAY_LINKS: continue
+            _put(root, wm, rel, s, 0o755 if rel in WIN_OVERLAY_EXEC else 0o644, text=True)
+    for rel, tgt in WIN_OVERLAY_LINKS.items():
+        dr = wm.resolve(os.path.dirname(rel)); rr = (dr + '/' if dr else '') + os.path.basename(rel)       # no caminho físico (pastas que são symlinks já seguidas)
+        p = os.path.join(root, rr)
+        os.makedirs(os.path.dirname(p), exist_ok=True)           # o mkext2 só desce em pastas que existem no disco
+        if os.path.lexists(p): os.unlink(p)
+        wm.set_link(rr, tgt)
 
 def swfl_dir(psdz): return os.path.join(psdz, 'swe', 'swfl')
 def pick(psdz, sid, ver=None):
@@ -65,46 +122,51 @@ def build(psdz, log=print, progress=lambda p, s: None):
     """Extrai app + data (HAR) para uma pasta de trabalho, aplica o overlay do IDEmu, os patches e grava mgu7/root.img + mgu7/bzImage (≈ 3,3 GB temporários)."""
     if not psdz: raise RuntimeError('escolha a pasta da PSdZData nas configurações')
     work = os.path.join(OUT, 'work'); root = os.path.join(work, 'root')
-    shutil.rmtree(work, ignore_errors=True); os.makedirs(root)
+    _rmtree(work); os.makedirs(root)
     try:
-        har = [sys.executable, '-I', TOOLS + '/har.py']
+        har = _py() + [TOOLS + '/har.py']
         n = len(APP_IDS) + len(DATA_IDS)
         for i, sid in enumerate(APP_IDS + DATA_IDS):
             kind = 'app' if sid in APP_IDS else 'data'
             progress(5 + int(40 * i / n), 'Extraindo o sistema do RSE' if kind == 'app' else 'Extraindo os dados do HMI')
             f = pick(psdz, '0000' + sid, APP_VER); log('%s %s' % (kind, os.path.basename(f)))
-            r = subprocess.run(har + [f, root], capture_output=True, text=True)
+            r = _run(har + [f, root])
             if r.returncode: raise RuntimeError('falha ao extrair %s: %s' % (os.path.basename(f), (r.stderr or r.stdout)[-200:]))
+            if IS_WIN and 'ignorados' in r.stdout: log(r.stdout.strip()[:600])          # nomes que o Windows não aceita (a extração segue)
         progress(70, 'Extraindo o kernel')
         k = pick(psdz, KERNEL_PKG, KERNEL_VER); log('kernel ' + os.path.basename(k))
-        r = subprocess.run(har + [k, os.path.join(work, 'k'), r'^/ias_rsu$'], capture_output=True, text=True)
+        r = _run(har + [k, os.path.join(work, 'k'), r'^/ias_rsu$'])
         ias = os.path.join(work, 'k', 'ias_rsu')
         if r.returncode or not os.path.isfile(ias): raise RuntimeError('kernel (ias_rsu) não encontrado no pacote do RSU')
         with open(ias, 'rb') as f: f.seek(KERNEL_SKIP); kb = f.read()
         if kb[0x202:0x206] != b'HdrS': raise RuntimeError('o kernel extraído não é um bzImage')
         progress(75, 'Aplicando os ajustes do emulador'); log('overlay')
-        shutil.copytree(TOOLS + '/rse_overlay', root, symlinks=True, dirs_exist_ok=True)
-        ld = os.path.join(root, 'lib', 'libdl-2.27.so')        # libdl do firmware, copiada para a pasta do IDEmu (não vai no repositório)
+        wm = _rootmeta().Meta(root) if IS_WIN else None      # Windows: symlinks e modos da raiz vivem no sidecar <raiz>/.idemu-meta.json (o NTFS não os guarda)
+        if IS_WIN: _win_overlay(root, wm)
+        else: shutil.copytree(TOOLS + '/rse_overlay', root, symlinks=True, dirs_exist_ok=True)
+        ld = os.path.join(root, 'lib', 'libdl-2.27.so') if wm is None else os.path.join(root, wm.resolve('lib/libdl-2.27.so'))        # libdl do firmware, copiada para a pasta do IDEmu (não vai no repositório)
         if os.path.isfile(ld):
-            os.makedirs(root + '/usr/lib/idemu', exist_ok=True); shutil.copy(ld, root + '/usr/lib/idemu/libdl.so.2')
-        shutil.copy(TOOLS + '/idemu-init.sh', root + '/idemu-init'); os.chmod(root + '/idemu-init', 0o755)
-        for src, dst in GUEST_FILES.items():
-            d = os.path.join(root, dst); os.makedirs(os.path.dirname(d), exist_ok=True); shutil.copy(os.path.join(GUEST, src), d); os.chmod(d, 0o755)
-        os.makedirs(root + '/etc/idemu', exist_ok=True)
-        r = subprocess.run([sys.executable, '-I', TOOLS + '/gen_fakesvc.py', root + '/etc/oap/someip/someip-interfaces.json', root + '/etc/idemu/fakesvc.tab'] + FAKE_SERVICES, capture_output=True, text=True)
+            if wm is None: os.makedirs(root + '/usr/lib/idemu', exist_ok=True)
+            _put(root, wm, 'usr/lib/idemu/libdl.so.2', ld, None if wm is None else 0o755)
+        _put(root, wm, 'idemu-init', TOOLS + '/idemu-init.sh', 0o755, text=True)
+        for src, dst in GUEST_FILES.items(): _put(root, wm, dst, os.path.join(GUEST, src), 0o755)
+        fk = wm.resolve('etc/idemu') if wm is not None else 'etc/idemu'; os.makedirs(os.path.join(root, fk), exist_ok=True)
+        ifc = os.path.join(root, wm.resolve('etc/oap/someip/someip-interfaces.json')) if wm is not None else root + '/etc/oap/someip/someip-interfaces.json'
+        r = _run(_py() + [TOOLS + '/gen_fakesvc.py', ifc, os.path.join(root, fk, 'fakesvc.tab')] + FAKE_SERVICES)
         if r.returncode: raise RuntimeError('gen_fakesvc: ' + (r.stderr or r.stdout)[-300:])
         allow_fake_offers(root, 10007)
-        r = subprocess.run([sys.executable, '-I', TOOLS + '/patch_rse.py', root], capture_output=True, text=True); log(r.stdout.strip())
+        r = _run(_py() + [TOOLS + '/patch_rse.py', root]); log(r.stdout.strip())
         if r.returncode: raise RuntimeError('patch do RSE: ' + (r.stderr or r.stdout)[-300:])
-        r = subprocess.run([sys.executable, '-I', TOOLS + '/gen_coding7.py', root + '/usr/bin/HmiMain3D', OUT + '/coding7.json'], capture_output=True, text=True); log(r.stdout.strip())
+        r = _run(_py() + [TOOLS + '/gen_coding7.py', root + '/usr/bin/HmiMain3D', OUT + '/coding7.json']); log(r.stdout.strip())
         if r.returncode: log('codificação: ' + (r.stderr or r.stdout)[-200:])         # sem o dicionário o editor de codificação não abre, o resto funciona
+        if wm is not None: wm.save()                                                  # o mkext2 lê o sidecar do disco
         progress(85, 'Gravando a imagem do sistema'); log('imagem')
         tmp = OUT + '/root.img.tmp'
-        r = subprocess.run([sys.executable, '-I', TOOLS + '/mkext2.py', root, tmp, str(IMG_MB)], capture_output=True, text=True); log(r.stdout.strip()[-200:])
+        r = _run(_py() + [TOOLS + '/mkext2.py', root, tmp, str(IMG_MB)]); log(r.stdout.strip()[-200:])
         if r.returncode: raise RuntimeError('mkext2: ' + (r.stderr or r.stdout)[-300:])
         os.replace(tmp, OUT + '/root.img'); open(OUT + '/bzImage', 'wb').write(kb); open(OUT + '/stamp', 'w').write(guest_stamp())
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        _rmtree(work)
 
 def allow_fake_offers(root, uid):
     """O vsomeip só deixa um usuário oferecer os serviços da sua política (etc/vsomeip/<uid>_<gid>/vsomeip_security.json). O `idemu-fakesvc` roda como o usuário do
@@ -121,37 +183,57 @@ def allow_fake_offers(root, uid):
                 if not any(o.get('service', '').lower() == i for o in offers): offers.append({'instance': 'any', 'service': i})
             break
     else: raise RuntimeError('política do uid %d não encontrada em %s' % (uid, path))
-    json.dump(d, open(path, 'w'), indent=4)
+    json.dump(d, open(path, 'w', newline='\n'), indent=4)          # newline='\n': no Windows o arquivo do guest não ganha CRLF
     # o roteador (vsomeipd) confere a política do cliente na configuração global: copia para lá a política do usuário já com as ofertas novas
     gpath = root + '/etc/vsomeip/vsomeip_security.json'; g = json.load(open(gpath)); mine = [p for p in d['security']['policies'] if str((p.get('credentials') or {}).get('uid')) == str(uid)][0]
     pols = [p for p in g['security']['policies'] if str((p.get('credentials') or {}).get('uid')) != str(uid)]
     g['security']['policies'] = pols + [mine]
-    json.dump(g, open(gpath, 'w'), indent=4)
+    json.dump(g, open(gpath, 'w', newline='\n'), indent=4)
 
-QEMU_OWN = os.path.join(ROOT, 'bin', 'qemu-system-x86_64')       # QEMU 11.1.2 do IDEmu: igual ao oficial + o dispositivo idemu-shm (src/qemu/idemu-shm.c)
+QEMU_OWN = os.path.join(ROOT, 'bin', 'qemu-system-x86_64' + EXE)       # QEMU 11.1.2 do IDEmu: igual ao oficial + o dispositivo idemu-shm (src/qemu/idemu-shm.c)
 QEMU_SHARE = os.path.join(ROOT, 'bin', 'qemu-share')              # firmware (BIOS, VGA) que o QEMU próprio procura
 SHM_BYTES = 128 << 20                                              # SHM_SIZE de src/mgu/proto.h
+# Windows: onde mais procurar um QEMU instalado (o do instalador oficial; sem o idemu-shm ele roda pela serial, ≈ 100x mais lento, e sem boot rápido)
+_WIN_QEMU = [os.path.join(os.environ.get(v, ''), 'qemu', 'qemu-system-x86_64.exe') for v in ('ProgramFiles', 'ProgramW6432', 'ProgramFiles(x86)') if os.environ.get(v)] if IS_WIN else []
 def find_qemu():
-    for p in (os.environ.get('IDEMU_QEMU_X86'), QEMU_OWN, shutil.which('qemu-system-x86_64'), '/opt/homebrew/bin/qemu-system-x86_64', '/usr/local/bin/qemu-system-x86_64'):
+    for p in (os.environ.get('IDEMU_QEMU_X86'), QEMU_OWN, shutil.which('qemu-system-x86_64'), '/opt/homebrew/bin/qemu-system-x86_64', '/usr/local/bin/qemu-system-x86_64') + tuple(_WIN_QEMU):
         if p and os.path.exists(p): return p
+    if IS_WIN: raise RuntimeError('qemu-system-x86_64.exe não encontrado: rode windows\\Build.ps1 (compila o QEMU do IDEmu para o Windows) ou instale o QEMU e aponte IDEMU_QEMU_X86')
     raise RuntimeError('qemu-system-x86_64 não encontrado: instale com "brew install qemu"')
 def has_shm(qemu):
     """O QEMU do IDEmu (bin/qemu-system-x86_64) tem o dispositivo idemu-shm: o canal gráfico vai por memória compartilhada (≈ 100x mais rápido que a serial)."""
-    return os.path.realpath(qemu) == os.path.realpath(QEMU_OWN) and os.path.isdir(QEMU_SHARE) and not os.environ.get('IDEMU_NO_SHM')
+    return os.path.normcase(os.path.realpath(qemu)) == os.path.normcase(os.path.realpath(QEMU_OWN)) and os.path.isdir(QEMU_SHARE) and not os.environ.get('IDEMU_NO_SHM')
 def shm_unlink(name):
+    if IS_WIN: return                      # mapeamento nomeado: o Windows o solta quando o QEMU e o glhost7 fecham
     try:
         import ctypes; ctypes.CDLL(None, use_errno=True).shm_unlink(name.encode())
     except Exception: pass
 
+def _accel():
+    """Aceleração do QEMU. macOS/Linux: sempre TCG. Windows: TCG, ou WHPX (experimental) com IDEMU_MGU7_ACCEL=whpx (precisa de um QEMU compilado com --enable-whpx e do recurso
+    'Plataforma de Hipervisor do Windows' ligado)."""
+    return 'whpx' if IS_WIN and (os.environ.get('IDEMU_MGU7_ACCEL') or 'tcg').strip().lower() == 'whpx' else 'tcg'
+def _win_nofast():
+    """Windows: o boot rápido (savevm/loadvm + qcow2 + reexecução do fluxo GL) ainda não foi validado; desligado, a menos que IDEMU_FASTBOOT=1 (precisa do qemu-img.exe)."""
+    return IS_WIN and not os.environ.get('IDEMU_FASTBOOT')
+def _qp(p):
+    """Caminho dentro de uma opção do QEMU (`file=...`): no Windows a vírgula do caminho precisa ser dobrada."""
+    return p.replace(',', ',,') if IS_WIN else p
+def _chardev_socket(cid, addr):
+    """-chardev que serve `addr` (o QEMU escuta, o IDEmu conecta): socket unix no macOS/Linux, TCP em 127.0.0.1 no Windows (addr = "127.0.0.1:porta", ver ipc.py)."""
+    if IS_WIN: return 'socket,id=%s,host=%s,port=%d,server=on,wait=off,nodelay=on' % (cid, ipc.LOOPBACK, ipc.port_of(addr))
+    return 'socket,id=%s,path=%s,server=on,wait=off' % (cid, addr)
+
 SNAP_TAG = 'idemu'
 def qemu_img():
-    for p in (os.environ.get('IDEMU_QEMU_IMG'), os.path.join(ROOT, 'bin', 'qemu-img'), shutil.which('qemu-img'), '/opt/homebrew/bin/qemu-img', '/usr/local/bin/qemu-img'):
+    for p in (os.environ.get('IDEMU_QEMU_IMG'), os.path.join(ROOT, 'bin', 'qemu-img' + EXE), shutil.which('qemu-img'), '/opt/homebrew/bin/qemu-img', '/usr/local/bin/qemu-img'):
         if p and os.path.exists(p): return p
 
 def clone_file(src, dst):
     """Cópia instantânea no APFS (clonefile); cópia comum nos demais sistemas de arquivos."""
     try: os.unlink(dst)
     except OSError: pass
+    if IS_WIN: shutil.copyfile(src, dst); return              # sem `cp` no Windows
     if subprocess.run(['cp', '-c', src, dst], capture_output=True).returncode: shutil.copyfile(src, dst)
 
 class Mgu7Runtime(runtime.Runtime):
@@ -167,9 +249,15 @@ class Mgu7Runtime(runtime.Runtime):
         if not image_ready(): raise RuntimeError('imagem do iDrive 7 não montada')
         find_qemu()
         for d in (self.run, self.logd): os.makedirs(d, exist_ok=True)
-        for f in ('frame.rgba', 'gl.sock', 'con.sock', 'inp.sock', 'mon.sock', 'gl.ready', 'gl.rec', 'gl.rec.done'):
+        if IS_WIN:                  # sem sockets em arquivo: portas novas a cada partida (os .port guardam as antigas), e o mapeamento do quadro antigo solto antes de apagá-lo
+            m, self._fm = self._fm, None; self._fm_key = None
+            try:
+                if m is not None: m.close()
+            except Exception: pass
+        for f in ('frame.rgba', 'gl.sock', 'cons.sock', 'inp.sock', 'mon.sock', 'gl.ready', 'gl.rec', 'gl.rec.done') + (('gl.rec.stop', 'gl.sock.port', 'cons.sock.port', 'inp.sock.port', 'mon.sock.port', 'shell.sock.port') if IS_WIN else ()):
             try: os.unlink(os.path.join(self.run, f))
             except OSError: pass
+        if IS_WIN: self.mon_path = ipc.addr(self.run, 'mon.sock')
         self.state = 'booting'; self.err = None; self.t0 = time.time(); self.boot_kind = 'cold'; self.stop_ev.clear(); self.marks = {}; self._fm = None; self._lastseq = None
         self.wl_ready.clear()
         try: self.coding_blob = coding7.build_blob(self.env) if coding7.available() else None       # codificação alterada pelo usuário (None = a padrão do HMI)
@@ -179,6 +267,7 @@ class Mgu7Runtime(runtime.Runtime):
     def _mark(self, name): self.marks[name] = round(time.time() - self.t0, 1)
     # ---------- snapshot (boot rápido): estado da VM (savevm do QEMU, dentro do qcow2 de escrita) + o fluxo GL gravado (o glhost7 o reexecuta no Mac) ----------
     def snap_capable(self):
+        if _win_nofast() or _accel() != 'tcg': return False         # Windows: boot rápido só com IDEMU_FASTBOOT=1; com o WHPX não há savevm/loadvm confiável
         return has_shm(find_qemu()) and bool(qemu_img()) and not os.environ.get('IDEMU_NO_SNAPSHOT')
     def snap_stamps(self):
         import hashlib, json
@@ -196,13 +285,15 @@ class Mgu7Runtime(runtime.Runtime):
     def snapshot_info(self):
         try: size = sum(os.path.getsize(os.path.join(self.snap_dir, f)) for f in os.listdir(self.snap_dir))
         except OSError: size = 0
-        return {'valid': self.snap_valid(), 'size': size, 'enabled': bool(self.env.get('fast_boot', True)), 'state': self.snap_state}
+        return {'valid': self.snap_valid(), 'size': size, 'enabled': bool(self.env.get('fast_boot', True)) and not _win_nofast(), 'state': self.snap_state}
     def drop_snapshot(self): shutil.rmtree(self.snap_dir, ignore_errors=True)
     def hmp(self, cmd, timeout=60.0):
-        """Comando do monitor do QEMU (HMP) pelo socket unix; devolve o texto até o próximo prompt."""
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(timeout)
+        """Comando do monitor do QEMU (HMP) pelo socket unix (TCP em 127.0.0.1 no Windows); devolve o texto até o próximo prompt."""
+        if IS_WIN: s = ipc.connect_once(self.mon_path); s.settimeout(timeout)
+        else: s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(timeout)
         try:
-            s.connect(self.mon_path); buf = b''
+            if not IS_WIN: s.connect(self.mon_path)
+            buf = b''
             while not buf.endswith(b'(qemu) '):
                 d = s.recv(4096)
                 if not d: raise OSError('monitor do QEMU fechou')      # antes: laço infinito a 100% de CPU
@@ -217,6 +308,7 @@ class Mgu7Runtime(runtime.Runtime):
         finally: s.close()
     def _ring_idle(self):
         """O host consumiu todo o fluxo publicado e espera uma mensagem nova (ponto seguro para o snapshot)? Lê o cabeçalho do anel (proto.h)."""
+        if IS_WIN: return self._ring_idle_win()
         import ctypes, mmap
         lib = ctypes.CDLL(None, use_errno=True); fd = lib.shm_open(self.shm.encode(), os.O_RDWR, 0o600)
         if fd < 0: return False
@@ -227,8 +319,33 @@ class Mgu7Runtime(runtime.Runtime):
                 return magic == 0x49444d47 and idle == 1 and g_tail == g_head
             finally: m.close()
         finally: os.close(fd)
+    def _ring_idle_win(self):
+        """_ring_idle no Windows: abre o mapeamento nomeado do QEMU ('Local\\<nome>') só para leitura com OpenFileMapping. Não usa mmap(tagname=...): ele CRIA o objeto se o
+        nome não existe, e um objeto de 4 KiB criado por nós antes do QEMU faria o idemu-shm falhar."""
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.OpenFileMappingW.restype = wintypes.HANDLE; k32.OpenFileMappingW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.MapViewOfFile.restype = ctypes.c_void_p; k32.MapViewOfFile.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
+        k32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]; k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.OpenFileMappingW(0x0004, False, shm_win_name(self.shm))          # FILE_MAP_READ
+        if not h: return False
+        try:
+            p = k32.MapViewOfFile(h, 0x0004, 0, 0, 4096)
+            if not p: return False
+            try:
+                raw = ctypes.string_at(p, 128)
+                magic, epoch, g_start, idle = struct.unpack_from('<IIQI', raw, 0); g_tail = struct.unpack_from('<Q', raw, 56)[0]; g_head = struct.unpack_from('<Q', raw, 120)[0]
+                return magic == 0x49444d47 and idle == 1 and g_tail == g_head
+            finally: k32.UnmapViewOfFile(p)
+        finally: k32.CloseHandle(h)
+    def _gl_stop_rec(self):
+        """Pede ao glhost7 que feche a gravação do fluxo GL (ele escreve gl.rec.done): SIGUSR1 no macOS/Linux; no Windows, sem sinais, cria o arquivo gl.rec.stop que ele confere."""
+        if IS_WIN: open(os.path.join(self.run, 'gl.rec.stop'), 'w').close(); return
+        import signal
+        os.kill(self.gl.pid, signal.SIGUSR1)
     def _take_snapshot(self):
-        import json, signal
+        import json
         tmp = self.snap_dir + '.tmp'
         try:
             self.snap_state = 'saving'; shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
@@ -241,7 +358,7 @@ class Mgu7Runtime(runtime.Runtime):
                 if self._ring_idle(): ok = True; break
                 self.hmp('cont'); time.sleep(0.5)
             if not ok: raise RuntimeError('o canal gráfico não ficou ocioso')
-            os.kill(self.gl.pid, signal.SIGUSR1); done = os.path.join(self.run, 'gl.rec.done')
+            self._gl_stop_rec(); done = os.path.join(self.run, 'gl.rec.done')
             for _ in range(100):
                 if os.path.exists(done): break
                 time.sleep(0.1)
@@ -262,9 +379,8 @@ class Mgu7Runtime(runtime.Runtime):
             except Exception: pass
     def _stop_recording(self):
         """Sem snapshot, a gravação do fluxo GL (texturas inclusive) não pode seguir crescendo pela sessão inteira."""
-        import signal
         try:
-            if self.gl is not None and self.gl.poll() is None: os.kill(self.gl.pid, signal.SIGUSR1)
+            if self.gl is not None and self.gl.poll() is None: self._gl_stop_rec()
         except OSError: pass
         for _ in range(50):
             if os.path.exists(os.path.join(self.run, 'gl.rec.done')): break
@@ -284,7 +400,7 @@ class Mgu7Runtime(runtime.Runtime):
         self.guest('date -s "%s" >/dev/null' % time.strftime('%Y-%m-%d %H:%M:%S'))
     def _boot_thread(self):
         try:
-            gsock = os.path.join(self.run, 'gl.sock'); csock = os.path.join(self.run, 'con.sock'); isock = os.path.join(self.run, 'inp.sock')
+            gsock = ipc.addr(self.run, 'gl.sock'); csock = ipc.addr(self.run, 'cons.sock'); isock = ipc.addr(self.run, 'inp.sock')      # POSIX: o caminho do socket unix; Windows: "127.0.0.1:porta"
             hl = open(os.path.join(self.logd, 'renderer.log'), 'wb')
             qemu = find_qemu(); self.shm = ('/idemu-gl-%d-%d' % (os.getpid(), int(time.time()) % 100000)) if has_shm(qemu) else None
             if self.shm: shm_unlink(self.shm)
@@ -295,22 +411,26 @@ class Mgu7Runtime(runtime.Runtime):
                 else:
                     try: os.unlink(self.overlay)
                     except OSError: pass
-                    r = subprocess.run([qemu_img(), 'create', '-q', '-f', 'qcow2', '-b', OUT + '/root.img', '-F', 'raw', self.overlay], capture_output=True, text=True)
+                    r = _run([qemu_img(), 'create', '-q', '-f', 'qcow2', '-b', OUT + '/root.img', '-F', 'raw', self.overlay])
                     if r.returncode: raise RuntimeError('qemu-img: ' + (r.stderr or r.stdout)[-200:])
             genv = dict(os.environ)
             if os.environ.get('IDEMU_PROF'): genv['GLHOST7_PROF'] = '1'
             if capable and not restore: genv['GLHOST7_REC'] = os.path.join(self.run, 'gl.rec')            # o fluxo do boot, para o snapshot
             glcmd = [glhost_path(), ('shm:' + self.shm) if self.shm else gsock, self.run] + (['--replay', os.path.join(self.snap_dir, 'gl.rec')] if restore else [])
-            port = 20000 + os.getpid() % 20000
-            disk = ['-drive', 'if=none,id=sd0,file=%s,format=qcow2,cache=writeback' % self.overlay] if capable else ['-drive', 'if=none,id=sd0,file=%s/root.img,format=raw,snapshot=on' % OUT]
-            cmd = [qemu] + (['-L', QEMU_SHARE] if self.shm else []) + ['-M', 'q35', '-cpu', 'Skylake-Client', '-accel', 'tcg,thread=multi', '-smp', '4', '-m', '3G', '-kernel', OUT + '/bzImage',
+            port = ipc.free_port() if IS_WIN else 20000 + os.getpid() % 20000          # Windows: porta livre de verdade (faixas reservadas pelo Hyper-V/WSL)
+            disk = ['-drive', 'if=none,id=sd0,file=%s,format=qcow2,cache=writeback' % _qp(self.overlay)] if capable else ['-drive', 'if=none,id=sd0,file=%s/root.img,format=raw,snapshot=on' % _qp(OUT)]
+            accel = _accel()                                                           # 'tcg' (padrão); WHPX só no Windows com IDEMU_MGU7_ACCEL=whpx: sem gdbstub, então sem tscfix e sem -S
+            cpu = (os.environ.get('IDEMU_MGU7_CPU') or 'Skylake-Client') if IS_WIN else 'Skylake-Client'
+            mon = ipc.chardev(self.mon_path) if IS_WIN else 'unix:%s,server,nowait' % self.mon_path
+            hold = (['-S'] + (['-gdb', 'tcp:127.0.0.1:%d' % port] if not restore else ['-loadvm', SNAP_TAG])) if accel == 'tcg' else []
+            cmd = [qemu] + (['-L', QEMU_SHARE] if self.shm else []) + ['-M', 'q35', '-cpu', cpu, '-accel', 'tcg,thread=multi' if accel == 'tcg' else 'whpx,kernel-irqchip=off', '-smp', '4', '-m', '3G', '-kernel', OUT + '/bzImage',
                    '-append', 'console=ttyS2,115200 root=/dev/mmcblk0 rootfstype=ext4 rw rootwait loglevel=4 nokaslr sdhci_pci.power_default_on=1 init=/idemu-init' + (' idemu.role=hu' if self.role == 'hu' else '') + (' idemu.coding=1' if self.coding_blob else ''),
                    '-device', 'sdhci-pci'] + disk + ['-device', 'sd-card,drive=sd0',
                    '-display', 'none', '-nic', 'none', '-rtc', 'base=localtime',            # o relógio do guest mostra a hora do Mac
-                   '-chardev', 'socket,id=inp,path=%s,server=on,wait=off' % isock, '-serial', 'chardev:inp',        # ttyS0: entrada (toque), lida pelo idemu-wl
-                   '-chardev', 'socket,id=gl,path=%s,server=on,wait=off' % gsock, '-serial', 'chardev:gl',
-                   '-chardev', 'socket,id=con,path=%s,server=on,wait=off' % csock, '-serial', 'chardev:con',
-                   '-monitor', 'unix:%s,server,nowait' % self.mon_path, '-S'] + (['-gdb', 'tcp:127.0.0.1:%d' % port] if not restore else ['-loadvm', SNAP_TAG]) + (['-device', 'idemu-shm,shm-name=%s,size=%d' % (self.shm, SHM_BYTES)] if self.shm else [])
+                   '-chardev', _chardev_socket('inp', isock), '-serial', 'chardev:inp',        # ttyS0: entrada (toque), lida pelo idemu-wl
+                   '-chardev', _chardev_socket('gl', gsock), '-serial', 'chardev:gl',
+                   '-chardev', _chardev_socket('con', csock), '-serial', 'chardev:con',
+                   '-monitor', mon] + hold + (['-device', 'idemu-shm,shm-name=%s,size=%d' % (self.shm, SHM_BYTES)] if self.shm else [])
             ql = open(os.path.join(self.logd, 'qemu.log'), 'wb')
             if restore:
                 self.step = 'Restaurando o estado salvo'; self.pct = 10
@@ -334,8 +454,9 @@ class Mgu7Runtime(runtime.Runtime):
             else:
                 self._spawn('gl', glcmd, stdout=hl, stderr=hl, env=genv)
                 self._spawn('q', cmd, stdout=ql, stderr=subprocess.STDOUT)       # parado (-S) até o tscfix liberar
-                tl = open(os.path.join(self.logd, 'tscfix.log'), 'wb')
-                self._spawn('tscfix', [sys.executable, '-I', TOOLS + '/tscfix.py', str(port)], stdout=tl, stderr=subprocess.STDOUT)
+                if accel == 'tcg':                                               # WHPX: sem gdbstub, nada a liberar (o kernel pode entrar em pânico em tk_setup_internals se o host não expuser o CPUID 0x15)
+                    tl = open(os.path.join(self.logd, 'tscfix.log'), 'wb')
+                    self._spawn('tscfix', [sys.executable, '-I', TOOLS + '/tscfix.py', str(port)], stdout=tl, stderr=subprocess.STDOUT)
                 threading.Thread(target=self._console_thread, args=(csock,), daemon=True).start()
                 threading.Thread(target=self._input_thread, args=(isock,), daemon=True).start()
                 self.step = 'Iniciando o sistema do carro'; self.pct = 5
@@ -371,12 +492,12 @@ class Mgu7Runtime(runtime.Runtime):
         s = None
         for _ in range(600):
             if self.stop_ev.is_set(): return
-            try: s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(path); break
-            except OSError: s.close(); s = None; time.sleep(0.1)
+            try: s = ipc.connect_once(path); break          # socket unix (macOS/Linux) ou TCP em 127.0.0.1 (Windows)
+            except OSError: s = None; time.sleep(0.1)
         if s is None: return
         self._con = s; log = open(os.path.join(self.logd, 'console.log'), 'wb'); tail = b''
         if self.mux is None:                      # o shell do guest (ttyS2) também fica em shell.sock e no SSH
-            self.mux = runtime.ConsoleMux(os.path.join(self.run, 'shell.sock'), self._con_write); self.mux.start(); self._start_ssh(); self._start_sim()
+            self.mux = runtime.ConsoleMux(ipc.addr(self.run, 'shell.sock'), self._con_write); self.mux.start(); self._start_ssh(); self._start_sim()
         try:
             while not self.stop_ev.is_set():
                 d = s.recv(4096)
@@ -392,9 +513,8 @@ class Mgu7Runtime(runtime.Runtime):
         """Liga ao socket da serial de entrada (ttyS0 do guest); só escreve nele (o guest não manda nada de volta)."""
         for _ in range(600):
             if self.stop_ev.is_set(): return
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try: s.connect(path); break
-            except OSError: s.close(); time.sleep(0.1)
+            try: s = ipc.connect_once(path); break
+            except OSError: time.sleep(0.1)
         else: return
         with self._inp_lock: self._inp = s
         if self.coding_blob:                         # a codificação vai pela mesma serial do toque, quando o compositor do guest já a lê (o init espera por ela antes de iniciar o HMI)
@@ -439,7 +559,9 @@ class Mgu7Runtime(runtime.Runtime):
         return d.replace('\r', '') if 'd' in dir() else ''
     def _kill_children(self):
         if self._con is not None:
-            try: self._con.close()
+            try:
+                if IS_WIN: ipc.shutdown_close(self._con)       # no Windows o close() não acorda o recv() da thread do console
+                else: self._con.close()
             except OSError: pass
             self._con = None
         for p in (self.tscfix,):

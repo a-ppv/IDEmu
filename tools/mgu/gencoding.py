@@ -68,7 +68,7 @@ def main():
         val = resolve(txt.get(name), default, enum)
         if val is None: miss += 1; val = 0
         out[fid] = val
-    with open(sys.argv[3], 'w') as f:
+    with open(sys.argv[3], 'w', newline='\n') as f:      # LF também no Windows: o libcod do guest lê linhas "id valor"
         for k in sorted(out): f.write('%x %d\n' % (k, out[k]))
     print('flags', len(out), 'sem valor', miss)
 

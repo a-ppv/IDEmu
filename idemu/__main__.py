@@ -1,4 +1,9 @@
 import sys, os, json
+if os.name == 'nt' and not sys.flags.utf8_mode and __name__ == '__main__':
+    # Windows: o texto padrão é cp1252; o IDEmu grava/lê UTF-8 (JSON com acentos, logs). Reinicia no modo UTF-8 do Python.
+    import subprocess
+    os.environ['PYTHONUTF8'] = '1'
+    sys.exit(subprocess.call([sys.executable, '-X', 'utf8', '-m', 'idemu'] + sys.argv[1:]))
 from . import server
 
 USAGE = """IDEmu - emulador de head unit BMW iDrive 6 (NBT Evo)

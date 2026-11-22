@@ -33,6 +33,10 @@ The QEMU script downloads the official QEMU 11.1.2 source into `~/idemu-qemu` an
 
 The resulting programs are `bin/qemu-system-arm` and `bin/glhost`. Their build products are not committed.
 
+### One-step scripts (native Linux)
+
+`linux/build-linux.sh` installs the packages for apt, dnf, pacman or zypper (`deps`) and runs the two builds above (`build`). `linux/IDEmu.sh` starts the server (it uses `xvfb-run` and software GL by itself when there is no display, and keeps fast boot off unless `--fast-boot`). `linux/package-linux.sh` makes `dist/IDEmu-linux-<arch>.tar.gz` (the Python package plus `bin/`); the target machine needs the runtime libraries (glib2, pixman, freeglut, GL, libpng). For Windows (native or WSL) see [WINDOWS.md](WINDOWS.md).
+
 ## Create and start an environment
 
 Use **New environment** in the normal IDEmu interface and select your own firmware packages, or use the usual command-line environment/build workflow. Check that `build.json` reports `hmi_validated: true`; fixed-address guest shims must match the exact `HmiMain3D` build.

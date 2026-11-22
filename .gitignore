@@ -35,3 +35,7 @@ __pycache__/
 .DS_Store
 *.log
 *.new
+
+# Pacotes gerados (windows\Package.ps1, linux\package-linux.sh) e o Python embutido do pacote Windows
+/dist/
+/python/

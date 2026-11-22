@@ -19,11 +19,21 @@ static CGLContextObj mapctx,mainctx;
 static int mapctx;
 #endif
 static double m_lat=-23.5505,m_lon=-46.6333,m_tlat=-23.5505,m_tlon=-46.6333,m_hdg,m_thdg; static float m_zoom=16; static int m_headup,m_night,m_dirty=1,m_pattern; static double m_last; static char m_attr[96];
+#ifdef _WIN32
+static int m_sock=-1; static struct sockaddr_in m_sa; static GLuint m_prog; static int m_havepos;
+#else
 static int m_sock=-1; static struct sockaddr_un m_sa; static GLuint m_prog; static int m_havepos;
+#endif
 static const char *m_cache(void){ const char*c=getenv("GLHOST_MAPCACHE"); return c?c:P("mapcache"); }
 static void map_notify(u32 surf){ if(!replaying) input_ev(30,surf,0,0); }
 
-static void map_request(int z,int x,int y){ if(replaying) return; if(m_sock<0){ m_sock=socket(AF_UNIX,SOCK_DGRAM,0); m_sa.sun_family=AF_UNIX; snprintf(m_sa.sun_path,sizeof m_sa.sun_path,"%s",P("map.sock")); }
+static void map_request(int z,int x,int y){ if(replaying) return;
+#ifdef _WIN32
+  if(m_sock<0){ if(!win_parse_addr(getenv("GLHOST_MAPSOCK"),&m_sa)) return; m_sock=(int)socket(AF_INET,SOCK_DGRAM,0); if(m_sock>=0) win_nonblock(m_sock); }
+  if(m_sock<0) return;
+#else
+  if(m_sock<0){ m_sock=socket(AF_UNIX,SOCK_DGRAM,0); m_sa.sun_family=AF_UNIX; snprintf(m_sa.sun_path,sizeof m_sa.sun_path,"%s",P("map.sock")); }
+#endif
   char b[64]; int n=snprintf(b,sizeof b,"%d %d %d",z,x,y); sendto(m_sock,b,n,MSG_DONTWAIT,(struct sockaddr*)&m_sa,sizeof m_sa); }
 static mtile_t *tile_slot(int z,int x,int y){ mtile_t *free_=0,*old=0; for(int i=0;i<NTILES;i++){ mtile_t*t=&mt[i]; if(t->z==z&&t->x==x&&t->y==y&&(t->tex||t->state)) return t; if(!t->tex&&!t->state){ if(!free_) free_=t; } else if(!old||t->last<old->last) old=t; }
   mtile_t *t=free_?free_:old; if(t->tex){ glDeleteTextures(1,&t->tex); t->tex=0; } t->z=z;t->x=x;t->y=y;t->state=0; return t; }

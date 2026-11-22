@@ -4,6 +4,18 @@ Emulador baseado em QEMU (placa OMAP5 personalizada) que roda o software **origi
 (QNX 6.5 + HmiMain3D) a partir dos pacotes SWFL do PSDZData, com interface gráfica própria, rotor iDrive,
 barramento CAN virtual, GPS simulado e acesso SSH ao console da head unit virtual.
 
+## Download
+
+<p>
+  <a href="https://github.com/herrbimmer/IDEmu/releases/latest/download/IDEmu-macos-arm64.zip"><img alt="Baixar para macOS (Apple Silicon)" src="https://img.shields.io/badge/Baixar-macOS%20(Apple%20Silicon)-000000?style=for-the-badge&logo=apple&logoColor=white"></a>
+  <a href="https://github.com/herrbimmer/IDEmu/releases/latest/download/IDEmu-windows-x64.zip"><img alt="Baixar para Windows (x64)" src="https://img.shields.io/badge/Baixar-Windows%2010%2F11%20(x64)-0078D4?style=for-the-badge&logo=windows&logoColor=white"></a>
+</p>
+
+Todas as versões em [Releases](https://github.com/herrbimmer/IDEmu/releases). Os pacotes trazem só o programa e os binários do QEMU/renderizadores. **Nenhum firmware, imagem ou dado da BMW vai junto**: use os seus próprios pacotes (veja [NOTICE](NOTICE)).
+
+* **Windows:** extraia e dê dois cliques em `IDEmu.bat` (o Python já vem junto; precisa de driver de vídeo com OpenGL, veja [docs/WINDOWS.md](docs/WINDOWS.md)).
+* **macOS (Apple Silicon):** extraia e, uma vez: `brew install glib pixman gnutls libpng libslirp zstd` e `xattr -dr com.apple.quarantine .`; depois `./IDEmu.command` (ou `python3 -m idemu gui`).
+
 ## Uso rápido
 
 ```bash
@@ -20,6 +32,8 @@ ou escolha um por um: não precisa ter a PSdZData inteira) → idioma/país/VIN/
 **Compilar** (≈ 20 s) → **Iniciar**. O primeiro boot leva ≈ 35–45 s e salva o estado do sistema; os seguintes levam ≈ 1 s.
 
 Linha de comando equivalente: `python3 -m idemu list | build <id> | run <id> | gui`.
+
+**Windows (nativo, todas as gerações; o iDrive 8 é lento em PC x86 por rodar em TCG):** compile uma vez com `windows\Build.ps1 -InstallMsys2` (MSYS2) e depois dê dois cliques em `IDEmu.bat`; `windows\Package.ps1` gera um `.zip` pronto. O launcher via WSL2 (`IDEmu-wsl.bat`) continua como alternativa. Passo a passo em [`docs/WINDOWS.md`](docs/WINDOWS.md) (testado no Windows 10: iDrive 5/6, 7 e CIC chegam ao HMI real; o iDrive 8 compila e as peças sobem, mas o boot completo não foi validado: o guest pede 12 GiB de memória comprometida). **Linux:** `linux/build-linux.sh` uma vez e depois `linux/IDEmu.sh` (`linux/package-linux.sh` gera o `.tar.gz`).
 
 ## O que é "não modificado"
 

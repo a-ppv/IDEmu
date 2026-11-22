@@ -1,3 +1,5 @@
+import os as _os, unittest as _ut
+if _os.name == 'nt': raise _ut.SkipTest('usa sockets unix (macOS/Linux)')
 """Testes do SshBridge/sshshell/guestfs com um "guest falso" (shell em pty atrás de um socket unix)
 e o cliente ssh real do macOS. O sshd roda como usuário atual, em porta alta, e é sempre encerrado."""
 import os

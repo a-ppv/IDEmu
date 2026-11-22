@@ -2,6 +2,8 @@
 
 **iDrive 7:** `har.py` (extrator HAR), `extract_rse.sh`, `mkext2.py` (imagem ext2 sem e2fsprogs), `tscfix.py` (contorno do pânico do relógio do kernel), `boot_mgu.sh` e `idemu-init.sh` (boot de teste). Ver `docs/OUTRAS_GERACOES.md`.
 
+*Windows nativo:* o NTFS não guarda symlinks (sem privilégio) nem bits `rwx`, então `har.py` (no Windows) grava os arquivos comuns no disco e anota symlinks e modos em `<raiz>/.idemu-meta.json` (`rootmeta.py`); `mkext2.py` junta o sidecar ao que está no disco ao gravar a imagem e marca a imagem como esparsa. O `mgu7.build` faz o resto (overlay, `idemu-init`, binários do guest). `boot_mgu.sh`, `go.sh`, `c.py` e `conctl.py` são roteiros de desenvolvimento do macOS (`/tmp`, fifo, socket unix) e não foram portados.
+
 
 Não fazem parte do emulador web. Montam e rodam o iDrive 8 como descrito em `docs/OUTRAS_GERACOES.md`, partindo da PSdZData.
 

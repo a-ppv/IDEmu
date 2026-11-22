@@ -68,6 +68,6 @@ def main():
                 val = bytes.fromhex(over[fname]) if fname in over else ser.default(f['dataRef'])[0]
                 lines.append('F %s %s %s %s %s %s' % ('-' if not g else g['id'], '-' if not s else s['id'], '-' if not n else '%x' % n['id'],
                                                       '-' if not n else n['eventgroups'][0], val.hex() or '-', fname))
-    open(dst, 'w').write('\n'.join(lines) + '\n')
+    open(dst, 'w', newline='\n').write('\n'.join(lines) + '\n')      # newline='\n': no Windows o guest leria "\r" no fim de cada campo
 
 if __name__ == '__main__': main()

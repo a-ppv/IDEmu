@@ -75,7 +75,9 @@ def from_psdz(psdz, out):
             B.member(os.path.join(psdz, 'swe/swfl', '%s.bin.%s' % (pkg, B.VER)), member, d + '/x.gz')
             B.simg(d + '/x.gz', d + '/%s.raw' % raw)
             os.unlink(d + '/x.gz')
-            grab(E4(d + '/%s.raw' % raw), src, d + '/' + dst)
+            e4 = E4(d + '/%s.raw' % raw)
+            try: grab(e4, src, d + '/' + dst)
+            finally: e4.close()                      # Windows: um arquivo aberto não pode ser apagado
             os.unlink(d + '/%s.raw' % raw)
         data = build(d + '/cafd.bin', d + '/coding.txt')
     write(data, out)

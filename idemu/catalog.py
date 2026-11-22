@@ -1,6 +1,6 @@
 """Catálogo do PSDZData: séries, chassis, pacotes SWFL necessários e versões disponíveis."""
 import os, re, json, glob, threading
-from . import codegen
+from . import codegen, hostos
 
 SETTINGS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'settings.json')
 
@@ -255,7 +255,7 @@ def stage_file(path, kind):
     dst = os.path.join(d, n)
     try:
         if os.path.lexists(dst): os.unlink(dst)
-        os.symlink(path, dst)
+        hostos.link_path(path, dst)
     except OSError as e: return False, 'não consegui gravar o link: %s' % e
     return True, 'ok'
 
@@ -271,6 +271,6 @@ def effective_psdz(kind):
             if not os.path.exists(dst):
                 try:
                     if os.path.lexists(dst): os.unlink(dst)
-                    os.symlink(i['path'], dst)
+                    hostos.link_path(i['path'], dst)
                 except OSError: pass
     return STAGE

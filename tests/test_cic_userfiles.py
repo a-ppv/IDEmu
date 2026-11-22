@@ -14,6 +14,7 @@ def hmiinput():
 
 
 class DirEntriesTest(unittest.TestCase):
+    @unittest.skipIf(__import__('os').name == 'nt', 'symlink exige privilegio no Windows')
     def test_arvore_modos_e_arquivos_ocultos(self):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, 'app', 'sub')); os.makedirs(os.path.join(d, '.git'))

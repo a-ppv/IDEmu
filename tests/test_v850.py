@@ -1,3 +1,5 @@
+import os as _os, unittest as _ut
+if _os.name == 'nt': raise _ut.SkipTest('usa sockets unix (macOS/Linux)')
 """Testes do V850 virtual: enlace UART <-> modelo, com um 'guest falso' que fala o protocolo do ioipc-idemu.so."""
 import os
 import socket

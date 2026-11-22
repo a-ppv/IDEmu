@@ -20,6 +20,8 @@ import struct
 import threading
 import time
 
+from . import ipc
+
 HELLO, TX, RX, DEBUG = 0, 1, 2, 0x10
 SIPC_OPEN, SIPC_DATA, SIPC_OUT, SIPC_CLOSE = 0x20, 0x21, 0x22, 0x23    # pontes TCP do guest (ver idemu/most.py)
 SB_LIST, SB_REGISTER = 0x24, 0x25                                      # servicebroker do guest (DSI)
@@ -131,9 +133,7 @@ class V850Link(object):
         t_end = time.time() + 120
         while self.alive and time.time() < t_end:
             try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.connect(self.uart_sock)
-                return s
+                return ipc.connect_once(self.uart_sock)
             except Exception:
                 time.sleep(0.5)
         return None
