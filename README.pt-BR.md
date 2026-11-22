@@ -32,6 +32,18 @@ São sugestões baseadas em como o emulador é construído e nos testes em Windo
 
 Você sempre precisa dos seus próprios pacotes de firmware da BMW (PSdZData); nenhum vem incluído.
 
+## Capturas de tela
+
+![Interface web do IDEmu: tela do carro, controle iDrive e sinais do CAN virtual](docs/screenshots/ui-main.png)
+
+| iDrive 5/6 (NBT Evo) | iDrive 7 | iDrive 8 |
+|---|---|---|
+| ![Início do iDrive 5/6](docs/screenshots/idrive5.png) | ![Início do iDrive 7](docs/screenshots/idrive7.png) | ![Início do iDrive 8](docs/screenshots/idrive8.png) |
+
+| CIC | Menu do telefone |
+|---|---|
+| ![Menu principal do CIC](docs/screenshots/cic.png) | ![Menu Comunicação](docs/screenshots/phone.png) |
+
 ## Uso rápido
 
 ```bash
