@@ -34,6 +34,18 @@ These are suggestions taken from how the emulator is built and from the Windows 
 
 You always need your own BMW firmware packages (PSdZData); none are included.
 
+## Screenshots
+
+![IDEmu web interface: car display, iDrive controller and virtual CAN signals](docs/screenshots/ui-main.png)
+
+| iDrive 5/6 (NBT Evo) | iDrive 7 | iDrive 8 |
+|---|---|---|
+| ![iDrive 5/6 home](docs/screenshots/idrive5.png) | ![iDrive 7 home](docs/screenshots/idrive7.png) | ![iDrive 8 home](docs/screenshots/idrive8.png) |
+
+| CIC | Phone menu |
+|---|---|
+| ![CIC main menu](docs/screenshots/cic.png) | ![Communication menu](docs/screenshots/phone.png) |
+
 ## Supported systems
 
 | System | Hardware / OS emulated | Level* | What works | What does not (yet) |
