@@ -9,6 +9,7 @@ class E4:
         s.fc=struct.unpack('<I',sb[92:96])[0]; s.ic=struct.unpack('<I',sb[96:100])[0]; s.ro=struct.unpack('<I',sb[100:104])[0]; s.dsz=struct.unpack('<H',sb[254:256])[0] or 32; s.first=struct.unpack('<I',sb[20:24])[0]
         s.b64=bool(s.ic&0x80); s.gdt=(s.first+1)*s.bs
     def rd(s,o,n): s.f.seek(o); return s.f.read(n)
+    def close(s): s.f.close()   # Windows: um arquivo aberto não pode ser apagado
     def inode(s,i):
         g=(i-1)//s.ipg; idx=(i-1)%s.ipg; d=s.rd(s.gdt+g*s.dsz,s.dsz); it=struct.unpack('<I',d[8:12])[0]
         if s.b64 and s.dsz>=64: it|=struct.unpack('<I',d[40:44])[0]<<32

@@ -6,11 +6,20 @@ import io, os, sys, tarfile, zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mkimagefs
 
+IS_WIN = os.name == 'nt'
 SEGS = [('voz', 20736698), ('base', 5610436), ('res', 45384615)]   # após os 3 primeiros segmentos (flash)
 START = 4980736 + 73662464 + 33554432
 LIMIT = 0x7ce0000 - 0x4d80000   # flash livre entre 0x4D80000 e a partição HBpersistence (127872K)
 
 FFS3_OFF, FFS3_LEN = 4980736 + 73662464, 33554432      # segmento 0x04D80000 (o EFS_RO original, FFS3)
+
+
+def _file_mode(p, name):
+    """Modo do arquivo no imagefs. POSIX: o do disco. Windows não tem bit de execução (o st_mode é sempre 0o666/0o444): scripts .sh e arquivos
+    sem extensão (os binários QNX do pacote não têm) entram executáveis (0o755), o resto 0o644."""
+    if not IS_WIN:
+        return (os.stat(p).st_mode & 0o777) or 0o644
+    return 0o755 if name.lower().endswith('.sh') or '.' not in name else 0o644
 
 
 def dir_entries(folder):
@@ -26,7 +35,7 @@ def dir_entries(folder):
             p = os.path.join(root, n); r = (n if rel == '.' else rel.replace(os.sep, '/') + '/' + n)
             if os.path.islink(p): out.append((r, 'L', os.readlink(p), 0o755))
             elif os.path.isfile(p):
-                with open(p, 'rb') as f: out.append((r, 'F', f.read(), (os.stat(p).st_mode & 0o777) or 0o644))
+                with open(p, 'rb') as f: out.append((r, 'F', f.read(), _file_mode(p, n)))
     return out
 
 

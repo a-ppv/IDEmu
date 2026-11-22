@@ -99,6 +99,7 @@ class VmHomeTest(unittest.TestCase):
         e = self.app.create(self.body)
         self.assertNotIn('home', e); self.assertFalse(os.path.islink(self.app.env_dir(e['id'])))
 
+    @unittest.skipIf(__import__('os').name == 'nt', 'symlink exige privilegio no Windows')
     def test_chosen_folder_link_duplicate_delete(self):
         e = self.app.create(dict(self.body, home=self.disk))
         d = self.app.env_dir(e['id']); real = os.path.join(os.path.realpath(self.disk), e['id'])

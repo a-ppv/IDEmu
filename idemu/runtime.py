@@ -1,10 +1,11 @@
 """Execução de um ambiente: renderizador (glhost) + QEMU + console serial + canais (shell, dados) + CAN/GPS/SSH."""
 import os, sys, time, json, shlex, hashlib, socket, select, subprocess, threading, signal, mmap, struct, zlib, collections
-from . import mapsvc, catalog
+from . import mapsvc, catalog, ipc, hostos
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, 'bin')
+EXE = '.exe' if ipc.IS_WIN else ''
 
 KEYS = {'MENU': 1, 'BACK': 2, 'OPTION': 3, 'CD': 4, 'RADIO': 5, 'TEL': 6, 'NAV': 7, 'PRESS': 8,
         'N': 9, 'S': 10, 'W': 11, 'E': 12, 'RIGHT': 13, 'LEFT': 14}
@@ -17,17 +18,12 @@ CPU = 'cortex-a15,cntfrq=6144000,has_el3=off,has_el2=off'
 SETBITS = '0x4a096804=2,0x4809a130=0x26,0x4a008f00=0x100,0x4a004400=0x100'
 # núcleos do OMAP5 emulados (1 ou 2). Com 2, cada vCPU roda numa thread do Mac (MTTCG) e o QNX (procnto-smp) distribui HMI e serviços entre eles.
 SMP = max(1, min(2, int(os.environ.get('IDEMU_SMP', '1') or 1)))
-QEMU_ARM = os.environ.get('IDEMU_QEMU_ARM') or os.path.join(BIN, 'qemu-system-arm')
+QEMU_ARM = os.environ.get('IDEMU_QEMU_ARM') or os.path.join(BIN, 'qemu-system-arm' + EXE)
+GLHOST = os.path.join(BIN, 'glhost' + EXE)
 
 def _unix_connect(path, timeout=30):
-    end = time.time() + timeout
-    while time.time() < end:
-        s = socket.socket(socket.AF_UNIX)
-        try:
-            s.connect(path); return s
-        except OSError:
-            s.close(); time.sleep(0.2)
-    raise RuntimeError('não conectou em ' + path)
+    """Conecta a um ponto do QEMU/glhost: socket unix (macOS/Linux) ou TCP em 127.0.0.1 (Windows); ver ipc.py."""
+    return ipc.connect(path, timeout)
 
 class ShellMux:
     """Serve um socket unix (shell.sock) ligado ao console de shell do guest (UART2)."""
@@ -36,9 +32,7 @@ class ShellMux:
         self.clients = []; self.lock = threading.Lock(); self.stop = False; self.up = False
         self.tail = collections.deque(maxlen=400)
     def start(self):
-        try: os.unlink(self.path)
-        except OSError: pass
-        self.srv = socket.socket(socket.AF_UNIX); self.srv.bind(self.path); self.srv.listen(8)
+        self.srv = ipc.listen(self.path)
         threading.Thread(target=self._accept, daemon=True).start()
         threading.Thread(target=self._pump, daemon=True).start()
     def _accept(self):
@@ -77,9 +71,7 @@ class ShellMux:
         socks = [getattr(self, 'srv', None), getattr(self, 'u', None)]
         with self.lock: socks += self.clients; self.clients = []
         for s in socks:                    # também a UART e os clientes: as sessões SSH abertas terminam em vez de ficarem penduradas
-            try:
-                if s: s.close()
-            except Exception: pass
+            ipc.shutdown_close(s)
 
 class ConsoleMux(ShellMux):
     """ShellMux de um console que outra parte do runtime já mantém aberto (o chardev do QEMU aceita um cliente só): `write(bytes)` manda ao guest e
@@ -87,9 +79,7 @@ class ConsoleMux(ShellMux):
     def __init__(self, path, write):
         ShellMux.__init__(self, None, path); self._write = write; self.up = True
     def start(self):
-        try: os.unlink(self.path)
-        except OSError: pass
-        self.srv = socket.socket(socket.AF_UNIX); self.srv.bind(self.path); self.srv.listen(8)
+        self.srv = ipc.listen(self.path)
         threading.Thread(target=self._accept, daemon=True).start()
     def _client(self, c):
         try:
@@ -136,7 +126,7 @@ class Runtime:
     def __init__(self, env_dir, env, run_root=None):
         self.env_dir, self.env = env_dir, env
         self.id = env['id']
-        self.run = os.path.join(run_root or '/tmp/idemu-%d' % os.getuid(), self.id)
+        self.run = os.path.join(run_root or ipc.run_root(), self.id)
         self.img = os.path.join(env_dir, 'images'); self.logd = os.path.join(env_dir, 'logs')
         self.ctl = os.path.join(self.run, 'ctl')
         self.state = 'stopped'; self.err = None; self.t0 = None; self.step = ''; self.pct = 0
@@ -152,7 +142,7 @@ class Runtime:
     def snapshot_key(self):
         """Muda quando qualquer coisa que o snapshot embute muda: imagens (inclusive shim.img, onde fica a codificação), binários, CPU."""
         parts = [SNAP_FORMAT, CPU, SETBITS, os.environ.get('IDEMU_CPU'), os.environ.get('IDEMU_QEMU_EXTRA')] + ([SMP] if SMP > 1 else [])
-        for p in [os.path.join(self.img, n) for n in ('boot.ifs', 'sda.img', 'sdb.img', 'shim.img')] + [QEMU_ARM, os.path.join(BIN, 'glhost'), os.path.join(HERE, 'data', 'stub.bin')]:
+        for p in [os.path.join(self.img, n) for n in ('boot.ifs', 'sda.img', 'sdb.img', 'shim.img')] + [QEMU_ARM, GLHOST, os.path.join(HERE, 'data', 'stub.bin')]:
             st = os.stat(p); parts.append((os.path.basename(p), st.st_size, int(st.st_mtime)))
         return hashlib.sha256(repr(parts).encode()).hexdigest()
 
@@ -172,6 +162,8 @@ class Runtime:
         return {'valid': self.snapshot_valid(), 'size': size, 'enabled': self.fast_boot_enabled()}
 
     def fast_boot_enabled(self):
+        if ipc.IS_WIN and not os.environ.get('IDEMU_FASTBOOT'):         # boot rápido ainda não validado no Windows: IDEMU_FASTBOOT=1 experimenta
+            return False
         return self.env.get('fast_boot', True) and not os.environ.get('IDEMU_NO_SNAPSHOT')
 
     def drop_snapshot(self):
@@ -202,28 +194,31 @@ class Runtime:
     def _launch(self, resume=False, record=False):
         """Sobe renderizador e QEMU; devolve os caminhos dos sockets seriais."""
         B = BIN + '/'; R = self.run + '/'
-        gls, ser, ser2, ser1, ser4 = R + 'gl.sock', R + 'ser.sock', R + 'ser2.sock', R + 'ser1.sock', R + 'ser4.sock'
+        gls, ser, ser2, ser1, ser4 = (ipc.addr(self.run, n) for n in ('gl.sock', 'ser.sock', 'ser2.sock', 'ser1.sock', 'ser4.sock'))
+        qmp = ipc.addr(self.run, 'qmp.sock')
         env = dict(os.environ, GLHOST_SOCK=gls, OMAP5_GLSOCK=gls, GLHOST_SHIDX=B + 'shader_index.txt',
                    GLHOST_GLSLDIR=B + 'glsl', GLHOST_MAPCACHE=mapsvc.CACHE, GLHOST_CTL=self.ctl, GLHOST_FRAME=self.frame_path,
                    OMAP5_SETBITS=SETBITS)
-        if self.env.get('show_window'): env['GLHOST_SHOW'] = '1'
+        if ipc.IS_WIN:       # Windows: o glhost fala TCP/UDP em 127.0.0.1 (os endereços são "127.0.0.1:porta") e avisa por arquivo que já escuta
+            env.update(GLHOST_INPUT=ipc.addr(self.ctl, 'input.sock'), GLHOST_MAPSOCK=ipc.addr(self.ctl, 'map.sock'), GLHOST_READY=os.path.join(self.run, 'gl.sock.ready'))
+        if self.env.get('show_window') or os.environ.get('IDEMU_SHOW_WINDOW'): env['GLHOST_SHOW'] = '1'
         S = self.snap_dir + '/'
         if resume: env['GLHOST_REPLAY'] = S + 'gl.rec'
         if record:
             os.makedirs(self.snap_dir, exist_ok=True); env['GLHOST_RECORD'] = S + 'gl.rec.tmp'
         self.step = 'Iniciando renderizador'; self.pct = 3
-        self._spawn('gl', [B + 'glhost'], env=env, stdout=self._log('renderer.log'), stderr=subprocess.STDOUT, cwd=B)
+        self._spawn('gl', [GLHOST], env=env, stdout=self._log('renderer.log'), stderr=subprocess.STDOUT, cwd=B)
         I = self.img + '/'
         args = [QEMU_ARM, '-M', 'omap5-uevm', '-m', '2048', '-cpu', os.environ.get('IDEMU_CPU', CPU), '-display', 'none',
                 '-smp', str(SMP), '-accel', 'tcg,thread=multi' if SMP > 1 else 'tcg',
-                '-serial', 'unix:%s,server,nowait' % ser, '-serial', 'unix:%s,server,nowait' % ser2,
-                '-serial', 'unix:%s,server,nowait' % ser1, '-serial', 'unix:%s,server,nowait' % ser4, '-monitor', 'none',
-                '-qmp', 'unix:%sqmp.sock,server,nowait' % R]
+                '-serial', ipc.chardev(ser), '-serial', ipc.chardev(ser2),
+                '-serial', ipc.chardev(ser1), '-serial', ipc.chardev(ser4), '-monitor', 'none',
+                '-qmp', ipc.chardev(qmp)]
         if resume:
             args += ['-S', '-incoming', 'file:%svm.bin' % S]
         else:
-            for _ in range(100):
-                if os.path.exists(gls): break
+            for _ in range(100 if not ipc.IS_WIN else 400):
+                if ipc.ready(self.run, 'gl.sock'): break
                 time.sleep(0.05)
             args += ['-device', 'loader,file=%sboot.ifs,addr=0x80100000' % I,
                      '-device', 'loader,file=%s,addr=0xbff00000' % os.environ.get('IDEMU_STUB', os.path.join(HERE, 'data', 'stub.bin')),
@@ -235,7 +230,7 @@ class Runtime:
         self.step = 'Iniciando QEMU'; self.pct = 5
         self._spawn('q', args, env=env, stdout=self._log('qemu.log'), stderr=subprocess.STDOUT)
         self.ser4 = ser4
-        self.qmp = Qmp(R + 'qmp.sock')
+        self.qmp = Qmp(qmp)
         return ser, ser2, ser1
 
     def _boot(self):
@@ -274,7 +269,7 @@ class Runtime:
             if time.time() > end or self._dead(): raise RuntimeError('o QEMU não terminou de carregar o snapshot')
             time.sleep(0.02)
         self._mark('vm_loaded'); self.pct = 50
-        while not os.path.exists(os.path.join(self.run, 'gl.sock')):
+        while not ipc.ready(self.run, 'gl.sock'):
             if time.time() > end or self._dead(): raise RuntimeError('o renderizador não restaurou o estado GL')
             time.sleep(0.02)
         self._mark('gl_loaded'); self.pct = 70
@@ -293,7 +288,7 @@ class Runtime:
     def _guest_alive(self, timeout):
         """Pergunta ao shell do guest (UART2): prova que o sistema restaurado continua rodando."""
         tag = b'IDEMU_ALIVE_%d' % int(time.time())
-        c = _unix_connect(os.path.join(self.run, 'shell.sock'), 5); c.settimeout(0.5); buf = b''; end = time.time() + timeout; last = 0
+        c = _unix_connect(ipc.addr(self.run, 'shell.sock'), 5); c.settimeout(0.5); buf = b''; end = time.time() + timeout; last = 0
         try:
             while time.time() < end:
                 if time.time() - last > 2:
@@ -449,8 +444,7 @@ class Runtime:
         except OSError: return
         while not self.stop_ev.is_set() and self.q is not None and self.q.poll() is None:
             try:
-                o = subprocess.run(['ps', '-o', 'time=', '-p', str(self.q.pid)], capture_output=True, text=True, timeout=3).stdout.strip()
-                m, sec = o.split(':'); c = int(m) * 60 + float(sec)
+                c = hostos.proc_info([self.q.pid])[self.q.pid][0]
             except Exception:
                 time.sleep(1); continue
             now = time.time()
@@ -487,7 +481,7 @@ class Runtime:
         self.cons.send((c + '\n').encode()); return self._drain(w)
 
     def _start_services(self, ser2, ser1, host=None):
-        self.mux = ShellMux(ser2, os.path.join(self.run, 'shell.sock')); self.mux.start()
+        self.mux = ShellMux(ser2, ipc.addr(self.run, 'shell.sock')); self.mux.start()
         try:
             from . import v850
             if os.environ.get('IDEMU_V850_EXTERNAL'): raise RuntimeError('V850 externo (modo de desenvolvimento): python3 -m idemu.v850')
@@ -530,6 +524,9 @@ class Runtime:
 
     def _start_ssh(self):
         """sshd sem root ligado ao shell.sock (console do guest)."""
+        if ipc.IS_WIN:        # sem sshd no Windows: o console do guest fica numa porta TCP local (telnet/ncat/PuTTY em modo "raw")
+            self.con.append('[idemu] console do guest (shell) em tcp %s: use "ncat" ou PuTTY (Raw). SSH não existe no Windows nativo' % ipc.addr(self.run, 'shell.sock'))
+            return
         try:
             from . import sshbridge
             self.ssh = sshbridge.SshBridge(self.env_dir, self.env.get('net', {}).get('ssh_port', 2222), os.path.join(self.run, 'shell.sock'))
@@ -541,7 +538,9 @@ class Runtime:
         """Popen que não deixa processo órfão: com o ambiente já parado, não inicia; o processo novo fica em self.<attr> antes que stop() possa olhar."""
         with self._life:
             if self.stop_ev.is_set(): raise BootStopped()
+            if ipc.IS_WIN: kw.setdefault('creationflags', hostos.CREATE_NO_WINDOW)        # sem janela de console do QEMU/glhost
             p = subprocess.Popen(*a, **kw); setattr(self, attr, p)
+            hostos.adopt_child(p)             # Windows: o processo morre junto com o servidor (sem QEMU/glhost órfãos)
             return p
 
     def stop(self):
@@ -645,8 +644,8 @@ class Runtime:
     def send_cmd(self, line):
         with self._cmd_lock:
             if getattr(self, '_insock', None) is None:
-                self._insock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            self._insock.sendto(line.encode(), os.path.join(self.ctl, 'input.sock'))
+                self._insock = ipc.dgram_socket()
+            ipc.dgram_send(self._insock, ipc.addr(self.ctl, 'input.sock'), line.encode())
 
     def key(self, code, val): self.send_cmd('1 %d %d' % (code, val))
     def touch(self, x, y, down, move=False):

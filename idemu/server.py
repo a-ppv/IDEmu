@@ -2,7 +2,7 @@
 import os, re, subprocess, json, time, shutil, threading, traceback, mimetypes, datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from . import catalog, builder, runtime, codegen, coding, coding7, coding8, stats, mgu, mgu7, phone, cluster, cic, vin, sysfiles
+from . import catalog, builder, runtime, codegen, coding, coding7, coding8, stats, mgu, mgu7, phone, cluster, cic, vin, sysfiles, hostos
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENVS = os.path.join(ROOT, 'environments')
@@ -83,10 +83,12 @@ class App:
         if not sp['writable']: raise ApiError('sem permissão para gravar na pasta escolhida')
         if sp['free'] < MIN_FREE: raise ApiError('a pasta escolhida tem menos de 1 GB livre')
         real = os.path.realpath(sp['path']); target = os.path.join(real, eid)
+        if hostos.is_wsl() and hostos.is_drvfs(real):
+            raise ApiError('no Windows/WSL a VM precisa ficar no disco do WSL (Linux): os discos do Windows (/mnt/c...) não aceitam os sockets e permissões que o IDEmu usa. Deixe a pasta padrão')
         if os.path.lexists(self.env_dir(eid)): raise ApiError('já existe um ambiente com esse id')
         if os.path.exists(target) and os.listdir(target): raise ApiError('já existe uma pasta "%s" com arquivos dentro da pasta escolhida' % eid)
         os.makedirs(target, exist_ok=True)
-        os.symlink(target, self.env_dir(eid))
+        hostos.link_path(target, self.env_dir(eid))          # symlink (POSIX) ou junção (Windows)
         return real
     def _free_id(self, base, home=None):
         eid = base; i = 2
@@ -460,6 +462,9 @@ def get_stats():
 def native_pick(kind, prompt='', start=None):
     """Seletor nativo do macOS (osascript). Devolve o caminho escolhido, ou None se o usuário cancelar. Levanta ApiError se não houver como abrir o diálogo."""
     import subprocess
+    if not hostos.IS_MAC:             # Windows (WSL2) e Linux: o macOS segue direto para o osascript abaixo, sem mudança
+        try: return hostos.native_pick(kind, prompt, start)
+        except hostos.PickerUnavailable as e: raise ApiError(str(e), 501)
     q = lambda x: '"' + str(x).replace('\\', '\\\\').replace('"', '\\"') + '"'
     loc = ''
     if start and os.path.isdir(os.path.expanduser(start)): loc = ' default location (POSIX file %s)' % q(os.path.expanduser(start))
@@ -488,7 +493,8 @@ def fs_list(path):
             except OSError: continue
             ents.append({'name': n, 'dir': d, 'size': sz})
     except PermissionError: raise ApiError('sem permissão', 403)
-    return {'path': path, 'parent': os.path.dirname(path) if path != '/' else None, 'entries': ents}
+    parent = os.path.dirname(path)
+    return {'path': path, 'parent': parent if parent and parent != path else None, 'entries': ents}
 
 class H(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -631,6 +637,10 @@ class H(BaseHTTPRequestHandler):
                 if len(P) > 3 and P[3] == 'reveal':
                     if m != 'POST': raise ApiError('use POST', 405)
                     os.makedirs(dd, exist_ok=True)
+                    if not hostos.IS_MAC:
+                        try: hostos.reveal(dd)
+                        except OSError as e: raise ApiError('não consegui abrir a pasta: %s' % str(e)[:160], 500)
+                        return {'ok': True}
                     r = subprocess.run(['open', dd], capture_output=True, text=True)
                     if r.returncode: raise ApiError('não consegui abrir a pasta: %s' % r.stderr.strip()[:160], 500)
                     return {'ok': True}
@@ -803,8 +813,10 @@ def serve(host='127.0.0.1', port=8765, open_browser=True):
         if getattr(APP, '_phone', None): APP._phone.stop()
         if APP.rt: APP.rt.stop()
         os._exit(0)
-    for sg in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sg, _bye)
+    for sg in (getattr(signal, n, None) for n in ('SIGTERM', 'SIGHUP', 'SIGBREAK')):      # SIGHUP não existe no Windows; lá o fechar-janela chega como SIGBREAK
+        if sg is not None:
+            try: signal.signal(sg, _bye)
+            except (ValueError, OSError): pass
     if open_browser:
         threading.Timer(0.6, lambda: _open(url)).start()
     try: srv.serve_forever()
@@ -814,6 +826,8 @@ def serve(host='127.0.0.1', port=8765, open_browser=True):
 
 def _open(url):
     import subprocess
+    if not hostos.IS_MAC:
+        hostos.open_url(url); return
     for app in ('Google Chrome', 'Chromium', 'Microsoft Edge', 'Brave Browser'):
         if os.path.isdir('/Applications/%s.app' % app):
             subprocess.Popen(['open', '-na', app, '--args', '--app=' + url, '--window-size=1400,900']); return

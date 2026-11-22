@@ -5,12 +5,12 @@ swfl_000003a6 (e do 417) e é compartilhada entre os ambientes. O QEMU (placa `c
 frame.rgb (CIC_FRAME) e recebe rotor/teclas por um socket (CIC_INPUT). Detalhes em docs/CIC.md.
 """
 import collections, glob, hashlib, importlib.util, json, os, shutil, socket, subprocess, threading, time
-from . import runtime
+from . import runtime, ipc, hostos
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, 'cic')
-QEMU = os.path.join(ROOT, 'bin', 'qemu-system-sh4')
-DEV_QEMU = os.path.expanduser('~/id4-qemu/build/qemu-system-sh4')     # compilado por src/cic/build.sh
+QEMU = os.path.join(ROOT, 'bin', 'qemu-system-sh4' + runtime.EXE)             # Windows: qemu-system-sh4.exe (tools/qemu/build-sh4-windows.sh)
+DEV_QEMU = os.path.expanduser('~/id4-qemu/build/qemu-system-sh4' + runtime.EXE)     # compilado por src/cic/build.sh
 VERSION = '008_090_002'
 PKGS = ('000003a6', '00000417')
 IMAGES = ('ifs.bin', 'flash.img', 'efs.ifs', 'build.json')
@@ -148,7 +148,7 @@ def build(psdz=None, log=print, progress=lambda p, s: None):
         shutil.copy2(DEV_QEMU, QEMU)
         log('QEMU atualizado a partir de %s' % DEV_QEMU)
     if not os.path.isfile(QEMU):
-        raise RuntimeError('bin/qemu-system-sh4 não existe: rode src/cic/build.sh')
+        raise RuntimeError('bin/qemu-system-sh4%s não existe: rode %s' % (runtime.EXE, 'tools/qemu/build-sh4-windows.sh (shell MSYS2 MINGW64)' if ipc.IS_WIN else 'src/cic/build.sh'))
     progress(5, 'Lendo o pacote %s' % os.path.basename(pkg))
     old = {k: os.environ.get(k) for k in ('CIC_NOECURESET',)}
     os.environ['CIC_NOECURESET'] = '1'           # se o Root pedir reset ele segue vivo (o HMI não some da tela)
@@ -198,11 +198,11 @@ class CicRuntime(runtime.Runtime):
         import hmiinput
         hmiinput.patch_flash_file(os.path.join(OUT, 'flash.img'))      # entrada do controlador (imagens montadas antes dela)
         if self.zbe: self.zbe.close(); self.zbe = None
-        shutil.rmtree(self.run, ignore_errors=True); os.makedirs(self.run); os.makedirs(self.logd, exist_ok=True)
+        shutil.rmtree(self.run, ignore_errors=True); os.makedirs(self.run, exist_ok=True); os.makedirs(self.logd, exist_ok=True)     # exist_ok: no Windows um arquivo ainda mapeado impede o rmtree completo
         # flash gravável desta execução (clone APFS, instantâneo): o snapshot=on gravava num qcow2 temporário e às vezes travava o QEMU
-        # numa gravação da flash (vCPU parado em blk_pwrite)
+        # numa gravação da flash (vCPU parado em blk_pwrite). Windows: não há `cp -c`, cópia comum (128 MB)
         fl = os.path.join(self.run, 'flash.img')
-        if subprocess.call(['cp', '-c', os.path.join(OUT, 'flash.img'), fl], stderr=subprocess.DEVNULL) != 0:
+        if hostos.IS_WIN or subprocess.call(['cp', '-c', os.path.join(OUT, 'flash.img'), fl], stderr=subprocess.DEVNULL) != 0:
             shutil.copyfile(os.path.join(OUT, 'flash.img'), fl)
         try:
             n = apply_userfiles(fl, self.env_dir, log=lambda m: self.con.append('[idemu] ' + m))
@@ -214,32 +214,43 @@ class CicRuntime(runtime.Runtime):
         threading.Thread(target=self._boot_thread, daemon=True).start()
 
     def _links(self):
+        """logs/ -> arquivos da execução. Devolve True se todos os links existem (no Windows o QEMU ainda pode não ter criado ser1.log/ser0.txt
+        quando isto roda: o laço de boot tenta de novo até dar certo; link simbólico se o Windows deixar, senão hardlink; ver hostos.link_path)."""
+        ok = True
         for name, target in (('console.log', 'ser1.log'), ('qemu.log', 'qemu.out'), ('renderer.log', 'ser0.txt')):
             p = os.path.join(self.logd, name)
             try:
+                if hostos.IS_WIN:
+                    if not os.path.exists(os.path.join(self.run, target)): ok = False; continue
+                    if os.path.lexists(p): os.unlink(p)
+                    hostos.link_path(os.path.join(self.run, target), p)
+                    continue
                 if os.path.lexists(p): os.unlink(p)
                 os.symlink(os.path.join(self.run, target), p)
             except OSError:
-                pass
+                ok = False
+        return ok
 
     def _boot_thread(self):
         try:
             cmd = _cicrun().qemu_cmd(OUT, run=self.run, qemu=QEMU, debug_log='', flash=os.path.join(self.run, 'flash.img'))
-            env = dict(os.environ, CIC_FRAME=self.frame_path, CIC_NORESET='1', CIC_INPUT=os.path.join(self.run, 'input.sock'),
-                       CIC_OUTPUT=os.path.join(self.run, 'output.sock'))
+            # CIC_INPUT/CIC_OUTPUT: no POSIX o caminho do socket unix de datagramas; no Windows "127.0.0.1:porta" (UDP em loopback), ver ipc.py
+            env = dict(os.environ, CIC_FRAME=self.frame_path, CIC_NORESET='1', CIC_INPUT=ipc.addr(self.run, 'input.sock'),
+                       CIC_OUTPUT=ipc.addr(self.run, 'output.sock'))
             self.zbe = VirtualZBE(self.run, self.send_cmd, log=self._most_log)
             self.zbe.language = language_code((self.env.get('coding') or {}).get('language', 'de_DE'))
             env.pop('CIC_DISPLAY', None)
             out = open(os.path.join(self.run, 'qemu.out'), 'wb')
             self._spawn('q', cmd, stdout=out, stderr=subprocess.STDOUT, env=env)
-            self._links()
+            linked = self._links()
             self._start_gps()
-            # console QNX (ksh na SCIF1) para o SSH e o shell.sock; o ShellMux espera o QEMU criar o socket
-            self.mux = runtime.ShellMux(os.path.join(self.run, 'ser1.sock'), os.path.join(self.run, 'shell.sock')); self.mux.start()
+            # console QNX (ksh na SCIF1) para o SSH e o shell.sock; o ShellMux espera o QEMU criar o socket (Windows: a porta TCP do chardev)
+            self.mux = runtime.ShellMux(ipc.addr(self.run, 'ser1.sock'), ipc.addr(self.run, 'shell.sock')); self.mux.start()
             slog = os.path.join(self.run, 'ser0.txt'); seen = set(); end = time.time() + 420
             while not self.stop_ev.is_set():
                 if self.q.poll() is not None: raise RuntimeError('o QEMU terminou (%s); veja o log do QEMU' % self.q.returncode)
                 if self.state == 'booting':
+                    if hostos.IS_WIN and not linked: linked = self._links()          # o QEMU cria ser1.log/ser0.txt depois de subir
                     txt = b''
                     for fn in (slog, os.path.join(self.run, 'ser1.log')):
                         try:
@@ -287,7 +298,7 @@ class CicRuntime(runtime.Runtime):
         except OSError: pass
 
     def _gps_connect(self):
-        try: s = runtime._unix_connect(os.path.join(self.run, 'ser0.sock'), 60)
+        try: s = runtime._unix_connect(ipc.addr(self.run, 'ser0.sock'), 60)
         except Exception: return
         if self.stop_ev.is_set(): s.close(); return
         self._gps_tx = s; self.antaris.start()
@@ -329,9 +340,9 @@ class CicRuntime(runtime.Runtime):
     def send_cmd(self, line):
         with self._cmd_lock:
             if self._sock is None:
-                self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                self._sock = ipc.dgram_socket()
             try:
-                self._sock.sendto(line.encode(), os.path.join(self.run, 'input.sock'))
+                ipc.dgram_send(self._sock, ipc.addr(self.run, 'input.sock'), line.encode())
             except OSError:
                 pass
 
@@ -396,11 +407,9 @@ class VirtualZBE:
 
     def __init__(self, run_dir, send, log=lambda s: None):
         self.send_cmd = send; self.log = log; self.cnt = 0; self.pos = 0x1000; self.lock = threading.Lock()
-        self.out = os.path.join(run_dir, 'output.sock'); self.registered = False; self.configured = False; self.seen = {}; self.subs = {}
+        self.out = ipc.addr(run_dir, 'output.sock'); self.registered = False; self.configured = False; self.seen = {}; self.subs = {}
         self.language = None                       # código do CurrentLanguage enviado quando o HMI configura o controlador
-        try: os.unlink(self.out)
-        except OSError: pass
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); self.sock.bind(self.out); self.sock.settimeout(0.5)
+        self.sock = ipc.dgram_bind(self.out); self.sock.settimeout(0.5)      # POSIX: unlink + bind do socket unix; Windows: UDP em 127.0.0.1:porta
         self.stop = threading.Event()
         threading.Thread(target=self._rx, daemon=True).start()
 
@@ -431,6 +440,8 @@ class VirtualZBE:
             try:
                 d = self.sock.recv(4096).decode(errors='ignore')
             except socket.timeout:
+                continue
+            except ConnectionResetError:           # Windows: ICMP "porta inalcançável" de um envio anterior; não é fim do socket
                 continue
             except OSError:
                 return

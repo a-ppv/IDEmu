@@ -3,7 +3,11 @@
  * FPGA Xilinx da Harman (10EE:7534) e Fujitsu Carmine (10CF:202B), no início só como memória/registradores simples.
  */
 #include "qemu/osdep.h"
+#ifdef _WIN32
+#include <windows.h>        /* CreateFileMapping/MapViewOfFile para o arquivo de quadros (o osdep.h já o traz; explícito por clareza) */
+#else
 #include <sys/mman.h>
+#endif
 #include "cpu.h"
 #include "ui/console.h"
 #include "system/runstate.h"
@@ -696,6 +700,36 @@ static void carmine_frame_tick(void *o)
     timer_mod(frame_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 33);
 }
 
+#ifdef _WIN32
+/* Windows: o arquivo é mapeado com CreateFileMapping/MapViewOfFile e aberto com FILE_SHARE_READ|WRITE|DELETE, para que o Python do IDEmu
+   (mmap ACCESS_READ) o leia e apague a pasta de execução enquanto o QEMU o mantém mapeado. A visão continua válida depois de fechar as alças. */
+static uint8_t *cic_win_map_file(const char *path, size_t len)
+{
+    HANDLE fh, mh;
+    void *p;
+    LARGE_INTEGER sz;
+    fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    sz.QuadPart = (LONGLONG)len;
+    if (!SetFilePointerEx(fh, sz, NULL, FILE_BEGIN) || !SetEndOfFile(fh)) {
+        CloseHandle(fh);
+        return NULL;
+    }
+    mh = CreateFileMappingA(fh, NULL, PAGE_READWRITE, (DWORD)((unsigned long long)len >> 32), (DWORD)(len & 0xffffffffu), NULL);
+    if (!mh) {
+        CloseHandle(fh);
+        return NULL;
+    }
+    p = MapViewOfFile(mh, FILE_MAP_ALL_ACCESS, 0, 0, len);
+    CloseHandle(mh);
+    CloseHandle(fh);
+    return p;
+}
+#endif
+
 static void carmine_frame_init(CicPciMem *s)
 {
     const char *path = getenv("CIC_FRAME");
@@ -703,6 +737,14 @@ static void carmine_frame_init(CicPciMem *s)
         return;
     }
     size_t sz = 32 + (size_t)CFB_W * CFB_H * 3;
+#ifdef _WIN32
+    frame_map = cic_win_map_file(path, sz);
+    if (!frame_map) {
+        error_report("cic: não consegui criar %s", path);
+        return;
+    }
+    memset(frame_map, 0, 32);              /* como o O_TRUNC do POSIX: nenhum quadro ainda (magic 0) */
+#else
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0 || ftruncate(fd, sz) != 0) {
         error_report("cic: não consegui criar %s", path);
@@ -717,6 +759,7 @@ static void carmine_frame_init(CicPciMem *s)
         frame_map = NULL;
         return;
     }
+#endif
     frame_timer = timer_new_ms(QEMU_CLOCK_REALTIME, carmine_frame_tick, s);
     timer_mod(frame_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
 }

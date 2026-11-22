@@ -45,12 +45,16 @@ def make_cert(ips):
            '[v3]\nsubjectAltName=%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' % san)
     with tempfile.NamedTemporaryFile('w', suffix='.cnf', delete=False) as f: f.write(cfg); cp = f.name
     try:
-        r = subprocess.run(['/usr/bin/openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '365', '-keyout', key, '-out', crt, '-config', cp],
+        import shutil
+        ossl = '/usr/bin/openssl' if os.path.exists('/usr/bin/openssl') else (shutil.which('openssl') or r'C:\Program Files\Git\usr\bin\openssl.exe')       # Windows: o do Git for Windows / MSYS2
+        r = subprocess.run([ossl, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '365', '-keyout', key, '-out', crt, '-config', cp],
                            capture_output=True, text=True, timeout=60)
     finally:
         os.unlink(cp)
     if r.returncode != 0: raise RuntimeError('não consegui criar o certificado HTTPS: ' + (r.stderr or '').strip()[-200:])
-    os.chmod(key, 0o600); json.dump(sorted(ips), open(meta, 'w'))
+    try: os.chmod(key, 0o600)
+    except OSError: pass
+    json.dump(sorted(ips), open(meta, 'w'))
     return crt, key
 
 

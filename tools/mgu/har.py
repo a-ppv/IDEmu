@@ -9,7 +9,7 @@ O cabeçalho traz o tamanho guardado (+12) e o bruto (+16) e o modo (+60..); os 
 Uso: har.py -l pacote.bin.*                lista
      har.py pacote.bin.* destino [regex]   extrai (só os caminhos que casam com a regex, se dada)
 """
-import sys, os, re, zlib, struct, stat as st
+import sys, os, re, shutil, zlib, struct, stat as st
 
 MAGIC = b'HAR#$%&@'
 
@@ -39,12 +39,62 @@ def unpack(d, name, raw, stored, data):
 def mode_of(head):
     return struct.unpack_from('<I', head, 60)[0]
 
+def main_win(d, out, rx):
+    """Extração no Windows: arquivos comuns vão para o disco; symlinks e modos (rwx) vão para o sidecar `<destino>/.idemu-meta.json` (tools/mgu/rootmeta.py),
+    de onde o mkext2.py os lê. O NTFS não guarda symlink sem privilégio nem bits de execução. Nomes que o Windows não aceita (`:`, `?`, `aux`...) são ignorados
+    e contados no fim, em vez de abortar a extração inteira."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import rootmeta, posixpath
+    L = rootmeta.lp; meta = rootmeta.Meta(out)
+    total = 0; done = {}; skipped = []
+
+    def drop_disk(p):                                  # tira o que houver no disco antes de registrar um symlink no lugar
+        if os.path.lexists(L(p)):
+            try: os.unlink(L(p))
+            except OSError: pass
+    for name, head, raw, stored, data, link in records(d):
+        m = mode_of(head); kind = 'd' if m and m & 0xF000 == 0x4000 else 'l' if m and m & 0xF000 == 0xA000 else 'f'
+        if rx and not rx.search(name): continue
+        rel = rootmeta.norm(name)
+        if not rel: continue
+        try:
+            dest = os.path.join(out, *rel.split('/'))
+            if kind == 'd': os.makedirs(L(dest), exist_ok=True); continue
+            os.makedirs(L(os.path.dirname(dest)), exist_ok=True)
+            if link is not None:
+                tgt_rel = rootmeta.norm(link)
+                tgt = os.path.join(out, *tgt_rel.split('/')) if tgt_rel else None
+                if kind != 'l' and tgt and os.path.isfile(L(tgt)):          # elo rígido: copia do destino (e leva o modo dele)
+                    meta.drop_link(rel); drop_disk(dest); shutil.copyfile(L(tgt), L(dest)); meta.set_mode(rel, meta.mode_of(tgt_rel) or 0o644)
+                else:                                                       # symlink (ou elo rígido cujo destino ainda não veio): destino literal
+                    drop_disk(dest); meta.set_link(rel, link)
+                continue
+            blob = unpack(d, name, raw, stored, data) if stored else b''
+            if kind == 'l':
+                drop_disk(dest); meta.set_link(rel, blob.decode())
+            else:
+                part = done.get(name, 0); cont = 0 < part < raw
+                if not cont:
+                    meta.drop_link(rel)                                     # um arquivo comum substitui um symlink de um pacote anterior
+                    if os.path.lexists(L(dest)): os.unlink(L(dest))
+                with open(L(dest), 'ab' if cont else 'wb') as f: f.write(blob)
+                done[name] = (part if cont else 0) + len(blob)
+                meta.set_mode(rel, (m or 0o644) & 0o7777)
+            total += len(blob)
+        except OSError as e:
+            skipped.append('%s (%s)' % (rel, str(e)[:70]))
+    meta.save()
+    print('extraído: %d bytes' % total + (' (%d nomes ignorados: o Windows não os aceita)' % len(skipped) if skipped else ''))
+    for s in skipped[:15]: print('  ignorado:', s)
+
+
 def main(argv):
     ls = argv and argv[0] == '-l'
     if ls: argv = argv[1:]
     pkg = argv[0]; d = open(pkg, 'rb').read()
     out = argv[1] if not ls else None
     rx = re.compile(argv[2]) if len(argv) > 2 else None
+    if os.name == 'nt' and not ls: return main_win(d, out, rx)
     total = 0; done = {}
     for name, head, raw, stored, data, link in records(d):
         m = mode_of(head); kind = 'd' if m and m & 0xF000 == 0x4000 else 'l' if m and m & 0xF000 == 0xA000 else 'f'

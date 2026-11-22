@@ -47,6 +47,7 @@ class PhoneTest(unittest.TestCase):
     def login(self, c=None):
         c = c or self.c; sc, _ = c.req('POST', '/login', {'pin': '123456'}); self.assertEqual(sc, 200); return c
 
+    @unittest.skipIf(not __import__('shutil').which('openssl'), 'precisa de openssl')
     def test_state_and_pin(self):
         self.assertTrue(self.st['running']); self.assertEqual(self.st['pin'], '123456'); self.assertTrue(self.st['https'])
         self.assertEqual(self.c.req('GET', '/p/state')[0], 401)
@@ -106,6 +107,7 @@ class PhoneTest(unittest.TestCase):
         self.login()
         self.assertEqual(self.c.req('POST', '/p/input', raw=b'{"t":"rotor","pad":"' + b'a' * (phone.MAX_BODY + 10) + b'"}')[0], 400)
 
+    @unittest.skipIf(not __import__('shutil').which('openssl'), 'precisa de openssl')
     def test_https_same_pin(self):
         c = Client(self.link.https_port, https=True)
         self.assertEqual(c.req('GET', '/p/state')[0], 401); self.login(c); self.assertEqual(c.req('GET', '/p/state')[0], 200)
@@ -118,6 +120,7 @@ class PhoneTest(unittest.TestCase):
 
 
 class CertTest(unittest.TestCase):
+    @unittest.skipIf(not __import__('shutil').which('openssl'), 'precisa de openssl')
     def test_cert_has_lan_ips_and_is_reused(self):
         with tempfile.TemporaryDirectory() as d:
             old, phone.CERT_DIR = phone.CERT_DIR, d

@@ -21,8 +21,15 @@
 #include "target/arm/cpu.h"
 #include "target/arm/arm-powerctl.h"
 #include "hw/core/cpu.h"
+#ifdef _WIN32
+/* Windows nativo: o glhost escuta em TCP 127.0.0.1 (OMAP5_GLSOCK = "127.0.0.1:porta"); o osdep.h do QEMU já traz o winsock2 */
+#include <ws2tcpip.h>
+#define GLB_CLOSE(fd) closesocket(fd)
+#else
 #include <sys/socket.h>
 #include <sys/un.h>
+#define GLB_CLOSE(fd) close(fd)
+#endif
 
 #define TYPE_OMAP5_UEVM MACHINE_TYPE_NAME("omap5-uevm")
 
@@ -191,14 +198,31 @@ static int glb_rw(int fd, void *b, size_t n, bool wr)
 static int glb_connect(void)
 {
     const char *path = getenv("OMAP5_GLSOCK");
+#ifdef _WIN32
+    struct sockaddr_in sa = { .sin_family = AF_INET };
+    const char *colon = path ? strrchr(path, ':') : NULL;
+    int on = 1;
+    int fd;
+    if (!colon) {
+        return -1;
+    }
+    sa.sin_port = htons((unsigned short)atoi(colon + 1));
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    fd = (int)socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&on, sizeof(on));
+#else
     struct sockaddr_un sa = { .sun_family = AF_UNIX };
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
     }
     snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path ? path : "/tmp/glbridge.sock");
+#endif
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        close(fd);
+        GLB_CLOSE(fd);
         return -1;
     }
     return fd;
@@ -221,7 +245,7 @@ static void glb_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     if (glb_rw(g->fd, &len, 4, true) || glb_rw(g->fd, g->ptr, len, true) ||
         glb_rw(g->fd, &rl, 4, false) || rl > GLB_HALF ||
         glb_rw(g->fd, g->ptr + GLB_HALF, rl, false)) {
-        close(g->fd);
+        GLB_CLOSE(g->fd);
         g->fd = -1;
         return;
     }

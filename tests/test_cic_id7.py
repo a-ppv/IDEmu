@@ -1,3 +1,5 @@
+import os as _os, unittest as _ut
+if _os.name == 'nt': raise _ut.SkipTest('usa sockets unix (macOS/Linux)')
 """CIC (antigo "iDrive 4") e iDrive 7: nome, nível de funcionalidade e o console compartilhado que alimenta o SSH."""
 import os, socket, sys, tempfile, threading, time, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

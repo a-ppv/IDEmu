@@ -4,6 +4,12 @@ set -e
 Q=${CIC_QEMU:-$HOME/id4-qemu/qemu-11.1.2}
 B=${CIC_BUILD:-$HOME/id4-qemu/build}
 H=$(cd "$(dirname "$0")" && pwd)
+# Windows (shell MSYS2 MINGW64, ver tools/qemu/build-sh4-windows.sh): o executável é qemu-system-sh4.exe. CIC_EXE força o sufixo
+# (CIC_EXE= vazio = sem sufixo) e CIC_PYTHON escolhe o Python dos patches; no macOS/Linux nada disto muda
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) EXE=.exe ;; *) EXE= ;; esac
+EXE=${CIC_EXE-$EXE}
+PY=${CIC_PYTHON:-python3}
+command -v "$PY" >/dev/null 2>&1 || PY=python
 # sed -i portátil (BSD/macOS exige sufixo separado, GNU/Linux não aceita '' separado): grava um .bak e o apaga
 sedi() { sed -i.idemu-bak "$@" && rm -f "${@: -1}.idemu-bak"; }
 cp "$H"/cic.c "$H"/cic_soc.c "$H"/cic_scif.c "$H"/cic_pci.c "$H"/cic.h "$Q/hw/sh4/"
@@ -21,18 +27,18 @@ config CIC
     select PCI
 EOK
 # log de exceções com TEA/TRA/EXPEVT (ajuda a depurar o QNX)
-grep -q "tea=%08x" "$Q/target/sh4/helper.c" || python3 - "$Q/target/sh4/helper.c" <<'EOP'
+grep -q "tea=%08x" "$Q/target/sh4/helper.c" || "$PY" - "$Q/target/sh4/helper.c" <<'EOP'
 import sys
-p = sys.argv[1]; s = open(p).read()
+p = sys.argv[1]; s = open(p, encoding='utf-8', newline='').read()
 s = s.replace('qemu_log("exception 0x%03x [%s] raised\\n",\n                  irq_vector, expname);',
               'qemu_log("exception 0x%03x [%s] raised tea=%08x tra=%x\\n",\n                  irq_vector, expname, env->tea, env->tra);')
-open(p, 'w').write(s)
+open(p, 'w', encoding='utf-8', newline='').write(s)
 EOP
 # RTE: a busca da instrução do delay slot de um RTE é privilegiada (o SR já voltou ao modo usuário); sem isto o get_physical_address dá
 # "Unauthorized access" quando a página do kernel não está no TLB do softmmu e o processo morre com SIGSEGV (ip = o RTE, ref = o delay slot)
-grep -q cic_sr_user "$Q/target/sh4/helper.c" || python3 - "$Q/target/sh4/helper.c" <<'EOP'
+grep -q cic_sr_user "$Q/target/sh4/helper.c" || "$PY" - "$Q/target/sh4/helper.c" <<'EOP'
 import sys
-p = sys.argv[1]; s = open(p).read()
+p = sys.argv[1]; s = open(p, encoding='utf-8', newline='').read()
 helper = """/* cic: a busca de instrução do delay slot de um RTE é feita em modo privilegiado mesmo com o SR já restaurado (modo usuário) */
 static inline bool cic_sr_user(CPUSH4State *env, MMUAccessType t)
 {
@@ -44,14 +50,14 @@ s = s.replace("/* Find the corresponding entry in the right TLB", helper + "/* F
 s = s.replace("use_asid = !(env->mmucr & MMUCR_SV) || !(env->sr & (1u << SR_MD));\n\n    if (access_type", "use_asid = !(env->mmucr & MMUCR_SV) || cic_sr_user(env, access_type);\n\n    if (access_type", 1)
 s = s.replace("if (!(env->sr & (1u << SR_MD)) && !(matching->pr & 2)) {", "if (cic_sr_user(env, access_type) && !(matching->pr & 2)) {")
 s = s.replace("        if (!(env->sr & (1u << SR_MD))\n                && (address < 0xe0000000 || address >= 0xe4000000)) {", "        if (cic_sr_user(env, access_type)\n                && (address < 0xe0000000 || address >= 0xe4000000)) {")
-open(p, 'w').write(s)
+open(p, 'w', encoding='utf-8', newline='').write(s)
 EOP
 # PREF em modo privilegiado carrega a TLB (no hardware pode gerar TLB miss). O handler de instrução ilegal do procnto faz "pref @spc"
 # antes de recarregar SSR/SPC/banco 1 e depois lê a instrução em SPC; sem o pref o TLB miss acontece dentro dessa janela, o handler de TLB
 # usa o banco 1 como rascunho, r1 vira lixo e o processo morre com SIGSEGV ip=88009162 (era o crash aleatório do devc-sersci)
-grep -q "cic: PREF" "$Q/target/sh4/translate.c" || python3 - "$Q/target/sh4/translate.c" <<'EOP'
+grep -q "cic: PREF" "$Q/target/sh4/translate.c" || "$PY" - "$Q/target/sh4/translate.c" <<'EOP'
 import sys
-p = sys.argv[1]; s = open(p).read()
+p = sys.argv[1]; s = open(p, encoding='utf-8', newline='').read()
 s = s.replace("""    case 0x0083: /* pref @Rn */
         return;""", """    case 0x0083: /* pref @Rn */
         /* cic: PREF */
@@ -65,13 +71,13 @@ s = s.replace("""    case 0x0083: /* pref @Rn */
             gen_set_label(skip);
         }
         return;""", 1)
-open(p, 'w').write(s)
+open(p, 'w', encoding='utf-8', newline='').write(s)
 EOP
 # gdbstub: blocos já traduzidos e encadeados (goto_tb) pulam a checagem de breakpoint; ao inserir um breakpoint o cache de
 # tradução é esvaziado (sem isso breakpoints reinseridos depois de um passo simples eram perdidos; só afeta depuração)
-grep -q "cic: blocos" "$Q/accel/tcg/tcg-accel-ops.c" || python3 - "$Q/accel/tcg/tcg-accel-ops.c" <<'EOP'
+grep -q "cic: blocos" "$Q/accel/tcg/tcg-accel-ops.c" || "$PY" - "$Q/accel/tcg/tcg-accel-ops.c" <<'EOP'
 import sys
-p = sys.argv[1]; s = open(p).read()
+p = sys.argv[1]; s = open(p, encoding='utf-8', newline='').read()
 old = """            err = cpu_breakpoint_insert(cpu, addr, BP_GDB, NULL);
             if (err) {
                 break;
@@ -79,12 +85,12 @@ old = """            err = cpu_breakpoint_insert(cpu, addr, BP_GDB, NULL);
         }
         return err;"""
 s = s.replace(old, old.replace("        return err;", "        /* cic: blocos já traduzidos e encadeados (goto_tb) pulam a checagem de breakpoint */\n        tb_flush__exclusive_or_serial();\n        return err;"), 1)
-open(p, 'w').write(s)
+open(p, 'w', encoding='utf-8', newline='').write(s)
 EOP
 # hypercall do IDEmu: "trapa #0xC3" com r0 = 0x1DE3xxxx é tratado pela placa (entrada do controlador, ver cic.c) e segue na instrução seguinte
-grep -q "sh4_cic_hypercall" "$Q/target/sh4/op_helper.c" || python3 - "$Q/target/sh4/op_helper.c" "$Q/target/sh4/cpu.h" <<'EOP'
+grep -q "sh4_cic_hypercall" "$Q/target/sh4/op_helper.c" || "$PY" - "$Q/target/sh4/op_helper.c" "$Q/target/sh4/cpu.h" <<'EOP'
 import sys
-p = sys.argv[1]; s = open(p).read()
+p = sys.argv[1]; s = open(p, encoding='utf-8', newline='').read()
 s = s.replace("""void helper_trapa(CPUSH4State *env, uint32_t tra)
 {
 """, """/* cic: hypercall do IDEmu (a placa instala o tratador) */
@@ -97,38 +103,38 @@ void helper_trapa(CPUSH4State *env, uint32_t tra)
         cpu_loop_exit(env_cpu(env));
     }
 """, 1)
-open(p, 'w').write(s)
-h = sys.argv[2]; s = open(h).read()
+open(p, 'w', encoding='utf-8', newline='').write(s)
+h = sys.argv[2]; s = open(h, encoding='utf-8', newline='').read()
 i = s.rindex('#endif')
 s = s[:i] + "/* cic: hypercall do IDEmu (trapa #0xC3) */\nextern bool (*sh4_cic_hypercall)(CPUSH4State *env);\n\n" + s[i:]
-open(h, 'w').write(s)
+open(h, 'w', encoding='utf-8', newline='').write(s)
 EOP
 # SH-4A tem movua.l (acesso desalinhado, pode cruzar páginas): wrap 32 bits em vez de abort
 grep -q "pointer_wrap = cpu_pointer_wrap_uint32" "$Q/target/sh4/cpu.c" || sedi 's/\.pointer_wrap = cpu_pointer_wrap_notreached/.pointer_wrap = cpu_pointer_wrap_uint32/' "$Q/target/sh4/cpu.c"
 # URC (contador aleatório da UTLB) nunca deve alcançar URB: as entradas URB..63 são "fixas" (wired)
-grep -q "urc >= urb" "$Q/target/sh4/helper.c" || python3 - "$Q/target/sh4/helper.c" <<'EOP'
+grep -q "urc >= urb" "$Q/target/sh4/helper.c" || "$PY" - "$Q/target/sh4/helper.c" <<'EOP'
 import sys
-p = sys.argv[1]; s = open(p).read()
+p = sys.argv[1]; s = open(p, encoding='utf-8', newline='').read()
 s = s.replace('if ((urb > 0 && urc > urb) || urc > (UTLB_SIZE - 1))', 'if ((urb > 0 && urc >= urb) || urc > (UTLB_SIZE - 1))')
-open(p, 'w').write(s)
+open(p, 'w', encoding='utf-8', newline='').write(s)
 EOP
 # SH7785 no modo de endereçamento de 32 bits: o PPN da UTLB vai até o bit 31 (o QEMU corta em 29 bits e joga a janela PCI em 0x1bxxxxxx)
 grep -q "cic: PPN32" "$Q/target/sh4/helper.c" || { sedi 's/(mem_value \& 0x1ffffc00) >> 10/(mem_value \& 0xfffffc00) >> 10; \/* cic: PPN32 *\//' "$Q/target/sh4/helper.c"; sedi 's/#define PTEL_PPN_BITS (19)/#define PTEL_PPN_BITS (22)/' "$Q/target/sh4/cpu.h"; }
 # interrupções IRL (INTEVT 0x200..0x3e0) têm nível fixo codificado no vetor: nível = (0xf0 - (vetor-0x200)/2) >> 4;
 # o sh_intc ignora prioridade (FIXME deles), o que gera tempestade quando o ISR roda com IMASK == nível
-grep -q "cic: IRL" "$Q/hw/intc/sh_intc.c" || python3 - "$Q/hw/intc/sh_intc.c" <<'EOP'
+grep -q "cic: IRL" "$Q/hw/intc/sh_intc.c" || "$PY" - "$Q/hw/intc/sh_intc.c" <<'EOP'
 import sys
-p = sys.argv[1]; s = open(p).read()
+p = sys.argv[1]; s = open(p, encoding='utf-8', newline='').read()
 s = s.replace("        if (source->pending) {\n            trace_sh_intc_pending(desc->pending, source->vect);",
 "        if (source->pending) {\n            /* cic: IRL */\n            if (source->vect >= 0x200 && source->vect <= 0x3e0 &&\n                ((0xf0 - ((source->vect - 0x200) >> 1)) >> 4) <= imask) {\n                continue;\n            }\n            trace_sh_intc_pending(desc->pending, source->vect);")
 s = s.replace("    g_assert_not_reached();\n}\n\ntypedef enum", "    return -1;\n}\n\ntypedef enum",1)
-open(p, 'w').write(s)
+open(p, 'w', encoding='utf-8', newline='').write(s)
 EOP
 # flash S29GL: o devf-generic usa o conjunto de comandos de proteção de setor (PPB, entrada AA 55 C0, saída 90 00) para checar/liberar setores;
 # o QEMU não o conhece, e o FFS3 monta a partição como somente leitura. Aqui todos os setores ficam sempre desprotegidos.
-grep -q "cic: PPB" "$Q/hw/block/pflash_cfi02.c" || python3 - "$Q/hw/block/pflash_cfi02.c" <<'EOP'
+grep -q "cic: PPB" "$Q/hw/block/pflash_cfi02.c" || "$PY" - "$Q/hw/block/pflash_cfi02.c" <<'EOP'
 import sys
-p = sys.argv[1]; s = open(p).read()
+p = sys.argv[1]; s = open(p, encoding='utf-8', newline='').read()
 s = s.replace("    uint8_t cmd;\n", "    uint8_t cmd;\n    uint8_t ppb_exit;   /* cic: PPB */\n", 1)
 s = s.replace("    switch (pfl->cmd) {\n    default:\n        /* This should never happen",
               "    switch (pfl->cmd) {\n    case 0xC0: /* cic: PPB: setores sempre desprotegidos */\n        ret = 1;\n        break;\n    default:\n        /* This should never happen", 1)
@@ -136,7 +142,10 @@ s = s.replace("    cmd = value;\n    if (pfl->cmd != 0xA0) {",
               "    cmd = value;\n    if (pfl->cmd == 0xC0) { /* cic: PPB (saída: 90 e 00) */\n        if (cmd == 0x00 && pfl->ppb_exit) { pfl->ppb_exit = 0; goto reset_flash; }\n        pfl->ppb_exit = (cmd == 0x90);\n        return;\n    }\n    if (pfl->cmd != 0xA0) {", 1)
 s = s.replace("        case 0x80: /* Erase */\n        case 0x90: /* Autoselect */\n        case 0xA0: /* Program */\n            pfl->cmd = cmd;\n            trace_pflash_write_start(pfl->name, cmd);\n            break;",
               "        case 0xC0: /* cic: PPB */\n            pfl->cmd = 0xC0; pfl->wcycle = 0; pfl->ppb_exit = 0;\n            return;\n        case 0x80: /* Erase */\n        case 0x90: /* Autoselect */\n        case 0xA0: /* Program */\n            pfl->cmd = cmd;\n            trace_pflash_write_start(pfl->name, cmd);\n            break;", 1)
-open(p, 'w').write(s)
+open(p, 'w', encoding='utf-8', newline='').write(s)
 EOP
-cd "$B" && ninja qemu-system-sh4
-cp "$B/qemu-system-sh4" "$H/../../bin/qemu-system-sh4" 2>/dev/null || true
+# CIC_PATCH_ONLY=1: só aplica os patches na árvore (o build-sh4-windows.sh precisa deles antes do configure)
+[ -n "${CIC_PATCH_ONLY:-}" ] && exit 0
+cd "$B" && ninja qemu-system-sh4$EXE
+mkdir -p "$H/../../bin"
+cp "$B/qemu-system-sh4$EXE" "$H/../../bin/qemu-system-sh4$EXE" 2>/dev/null || true

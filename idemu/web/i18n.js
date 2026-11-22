@@ -1459,6 +1459,17 @@ window.IDE = window.IDE || {};
     ['Seguem o volante', 'Follow the steering'],
     ['Espelhar a imagem', 'Mirror the image'],
     ['Muda a marcha no CAN virtual para testar.', 'Changes the gear on the virtual CAN bus for testing.'],
+    ['bin/qemu-system-sh4%s não existe: rode %s', 'bin/qemu-system-sh4%s does not exist: run %s'],
+    ['sem memória virtual para os %d GiB de RAM do iDrive 8 (livre: %d MiB de RAM + arquivo de paginação): feche programas ou aumente o arquivo de paginação (%s)', 'not enough virtual memory for the %d GiB of iDrive 8 RAM (free: %d MiB of RAM + page file): close programs or increase the page file (%s)'],
+    ['não consegui ligar ao console do QEMU em %s; veja logs/qemu.log', 'could not connect to the QEMU console at %s; see logs/qemu.log'],
+    ['qemu-system-aarch64.exe não encontrado em bin/: compile com "bash tools/qemu/build-aarch64-windows.sh" no shell MSYS2 MINGW64', 'qemu-system-aarch64.exe not found in bin/: build it with "bash tools/qemu/build-aarch64-windows.sh" in the MSYS2 MINGW64 shell'],
+    ['(emulação TCG: pode levar vários minutos)', '(TCG emulation: it can take several minutes)'],
+    ['o HMI não desenhou em %d minutos; veja logs/console.log', 'the HMI did not draw within %d minutes; see logs/console.log'],
+    ['mguhost.exe não encontrado em bin/: compile com "bash src/mgu22/build-windows.sh host" no shell MSYS2 MINGW64', 'mguhost.exe not found in bin/: build it with "bash src/mgu22/build-windows.sh host" in the MSYS2 MINGW64 shell'],
+    ['ANGLE não encontrado: instale o Microsoft Edge ou o Google Chrome (de 64 bits), ou defina IDEMU_ANGLE com a pasta de libEGL.dll e libGLESv2.dll', 'ANGLE not found: install Microsoft Edge or Google Chrome (64-bit), or set IDEMU_ANGLE to the folder with libEGL.dll and libGLESv2.dll'],
+    ['(achei, mas de outra arquitetura: %s)', '(found, but of another architecture: %s)'],
+    ['qemu-system-x86_64.exe não encontrado: rode windows\\Build.ps1 (compila o QEMU do IDEmu para o Windows) ou instale o QEMU e aponte IDEMU_QEMU_X86', 'qemu-system-x86_64.exe not found: run windows\\Build.ps1 (builds the IDEmu QEMU for Windows) or install QEMU and point IDEMU_QEMU_X86 to it'],
+    ['no Windows/WSL a VM precisa ficar no disco do WSL (Linux): os discos do Windows (/mnt/c...) não aceitam os sockets e permissões que o IDEmu usa. Deixe a pasta padrão', 'on Windows/WSL the VM must live on the WSL (Linux) disk: Windows drives (/mnt/c...) do not support the sockets and permissions IDEmu uses. Keep the default folder'],
   ];
 /* I18N-DICT-END */
 

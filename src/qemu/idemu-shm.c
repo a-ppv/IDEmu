@@ -7,6 +7,11 @@
  *
  *   -device idemu-shm,shm-name=/idemu-gl-123,size=128M
  *
+ * Windows nativo (MinGW-w64): não existe shm_open nem memory_region_init_ram_from_fd. O dispositivo cria um mapeamento
+ * NOMEADO com CreateFileMappingA(INVALID_HANDLE_VALUE, ..., "Local\idemu-gl-123") (shm-name sem a "/" inicial, prefixo
+ * "Local\"), mapeia com MapViewOfFile e entrega o ponteiro ao QEMU com memory_region_init_ram_ptr(). O glhost7 e o IDEmu
+ * (Python) abrem o mesmo nome com OpenFileMapping. A propriedade shm-name continua igual nos dois sistemas.
+ *
  * Licença GPL v2 ou posterior, como o resto do QEMU.
  */
 #include "qemu/osdep.h"
@@ -28,12 +33,18 @@ struct IdemuShm {
     char *shm_name;
     uint64_t size;
     int fd;
+#ifdef _WIN32
+    HANDLE hmap;
+    void *view;
+#endif
 };
 
 static void idemu_shm_realize(PCIDevice *dev, Error **errp)
 {
     IdemuShm *s = IDEMU_SHM(dev);
+#ifndef _WIN32
     int fd;
+#endif
 
     if (!s->shm_name || s->shm_name[0] != '/') {
         error_setg(errp, "idemu-shm: informe shm-name=/nome");
@@ -43,6 +54,43 @@ static void idemu_shm_realize(PCIDevice *dev, Error **errp)
         error_setg(errp, "idemu-shm: size deve ser potência de 2 (>= 4K)");
         return;
     }
+#ifdef _WIN32
+    {
+        char wname[256];
+
+        if (strlen(s->shm_name) + sizeof("Local\\") > sizeof(wname) ||
+            strchr(s->shm_name + 1, '\\')) {
+            error_setg(errp, "idemu-shm: shm-name inválido para o Windows: %s", s->shm_name);
+            return;
+        }
+        /* "/idemu-gl-123" -> "Local\idemu-gl-123" (o namespace Local não pede privilégio) */
+        snprintf(wname, sizeof(wname), "Local\\%s", s->shm_name + 1);
+        SetLastError(0);                    /* GetLastError() só vale como ERROR_ALREADY_EXISTS logo depois da chamada */
+        s->hmap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                     (DWORD)(s->size >> 32),
+                                     (DWORD)(s->size & 0xffffffffu), wname);
+        if (!s->hmap) {
+            error_setg_win32(errp, GetLastError(), "idemu-shm: CreateFileMapping(%s)", wname);
+            return;
+        }
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            /* um objeto com esse nome já existia (outro QEMU, ou alguém o criou antes com outro tamanho) */
+            CloseHandle(s->hmap);
+            s->hmap = NULL;
+            error_setg(errp, "idemu-shm: o mapeamento %s já existe", wname);
+            return;
+        }
+        s->view = MapViewOfFile(s->hmap, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)s->size);
+        if (!s->view) {
+            error_setg_win32(errp, GetLastError(), "idemu-shm: MapViewOfFile(%s)", wname);
+            CloseHandle(s->hmap);
+            s->hmap = NULL;
+            return;
+        }
+        /* RAM de um ponteiro externo (RAM_PREALLOC): o TCG acessa direto, e o vmstate_register_ram abaixo a põe no savevm */
+        memory_region_init_ram_ptr(&s->bar, OBJECT(dev), "idemu-shm", s->size, s->view);
+    }
+#else
     fd = shm_open(s->shm_name, O_CREAT | O_RDWR, 0600);
     if (fd < 0) {
         error_setg_errno(errp, errno, "idemu-shm: shm_open(%s)", s->shm_name);
@@ -59,6 +107,7 @@ static void idemu_shm_realize(PCIDevice *dev, Error **errp)
         return;
     }
     s->fd = fd;
+#endif
     vmstate_register_ram(&s->bar, DEVICE(dev));      /* sem isto o bloco de RAM não tem nome e não entra no snapshot */
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_PREFETCH | PCI_BASE_ADDRESS_MEM_TYPE_64, &s->bar);
@@ -68,9 +117,13 @@ static void idemu_shm_exit(PCIDevice *dev)
 {
     IdemuShm *s = IDEMU_SHM(dev);
     vmstate_unregister_ram(&s->bar, DEVICE(dev));
+#ifdef _WIN32
+    /* a visão e o mapeamento ficam até o processo terminar: o bloco de RAM ainda aponta para ela, e o Windows solta o nome sozinho quando o último processo sai */
+#else
     if (s->shm_name) {
         shm_unlink(s->shm_name);
     }
+#endif
 }
 
 static const VMStateDescription vmstate_idemu_shm = {

@@ -1,3 +1,5 @@
+import os as _os, unittest as _ut
+if _os.name == 'nt': raise _ut.SkipTest('usa sockets unix (macOS/Linux)')
 import os
 import shutil
 import socket

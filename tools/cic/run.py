@@ -5,9 +5,10 @@ import os, subprocess, sys, time, signal
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bootinfo, efs
 HOME = os.path.expanduser('~')
-QEMU = os.environ.get('CIC_QEMU', HOME + '/id4-qemu/build/qemu-system-sh4')
+IS_WIN = os.name == 'nt'
+QEMU = os.environ.get('CIC_QEMU', HOME + '/id4-qemu/build/qemu-system-sh4' + ('.exe' if IS_WIN else ''))
 IFS = os.environ.get('CIC_IFS', HOME + '/Downloads/System files/ID4/swfl_000003a6.bin.008_090_002')
-D = os.environ.get('CIC_DIR', '/tmp/cic')
+D = os.environ.get('CIC_DIR') or ('/tmp/cic' if not IS_WIN else os.path.join(os.environ.get('TEMP') or HOME, 'cic'))
 
 FULL_BOOT = '''cp /usr/bin/memifs2 /tmp/memifs2
 slogger -s128 &
@@ -168,7 +169,8 @@ def prepare(D, pkg=None, log=print):
         os.environ['CIC_EFS_FLASH'] = D + '/efs.ifs'
         ifs2 = '/tmp/memifs2 -q -L -C 8 -D -o 0x00740000 / &\nwaitfor /usr/HBproject/CicHighEceUsaSecond 90\n' if os.environ.get('CIC_IFS2', '0') == '1' else ''
         ionet = '(waitfor /etc/IFS2Ready 600; io-net -ptcpip-v4 forward; waitfor /dev/socket 30; ifconfig lo0 127.0.0.1) &\n' if os.environ.get('CIC_IONET', '1') == '1' else ''
-        open(D + '/boot.sh', 'w').write(FULL_BOOT.replace('@IFS2@', ifs2).replace('@IONET@', ionet))
+        # newline='\n': o roteiro roda no ksh do QNX, sem CRLF mesmo quando gerado no Windows
+        with open(D + '/boot.sh', 'w', encoding='utf-8', newline='\n') as bf: bf.write(FULL_BOOT.replace('@IFS2@', ifs2).replace('@IONET@', ionet))
         cmds = D + '/boot.sh'
     if cmds:
         files.append((open(cmds, 'rb').read(), 'etc/hosts', 'c'))
@@ -180,6 +182,14 @@ def prepare(D, pkg=None, log=print):
         log('flash NOR de 128 MB')
         build_flash(D + '/flash.img')
 
+def _ipc():
+    """idemu/ipc.py (a mesma instância do servidor, se ele já a carregou): endereços de socket = caminho no POSIX, 127.0.0.1:porta no Windows."""
+    m = sys.modules.get('idemu.ipc')
+    if m is None:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+        from idemu import ipc as m
+    return m
+
 def qemu_cmd(D, run=None, qemu=None, debug_log=None, flash=None):
     """Linha de comando do QEMU para as imagens em D; sockets e logs vão para run (padrão: D).
     debug_log: flags do -d (None = CIC_D ou 'guest_errors,unimp'; '' = sem log, bem mais rápido).
@@ -189,15 +199,27 @@ def qemu_cmd(D, run=None, qemu=None, debug_log=None, flash=None):
         try: os.remove(os.path.join(run, f))
         except OSError: pass
     dl = os.environ.get('CIC_D', 'guest_errors,unimp') if debug_log is None else debug_log
-    cmd = [qemu or QEMU, '-M', 'cic', '-m', os.environ.get('CIC_RAM', '384'), '-display', os.environ.get('CIC_DISPLAY', 'none'), '-monitor', 'unix:%s/mon.sock,server,nowait' % run,
+    if IS_WIN:
+        # Windows nativo: monitor e UARTs são TCP em 127.0.0.1 (idemu/ipc.py reserva as portas; o endereço é "127.0.0.1:porta"); vírgula em caminho vira ",,"
+        ipc = _ipc(); q = lambda p: p.replace(',', ',,')
+        port = lambda name: ipc.port_of(ipc.addr(run, name))
+        mon = ipc.chardev(ipc.addr(run, 'mon.sock'))
+        s0 = 'socket,id=s0,host=127.0.0.1,port=%d,server=on,wait=off' % port('ser0.sock')
+        s1 = 'socket,id=s1,host=127.0.0.1,port=%d,server=on,wait=off,logfile=%s/ser1.log' % (port('ser1.sock'), q(run))
+    else:
+        q = lambda p: p
+        mon = 'unix:%s/mon.sock,server,nowait' % run
+        s0 = 'socket,id=s0,path=%s/ser0.sock,server=on,wait=off' % run
+        s1 = 'socket,id=s1,path=%s/ser1.sock,server=on,wait=off,logfile=%s/ser1.log' % (run, run)
+    cmd = [qemu or QEMU, '-M', 'cic', '-m', os.environ.get('CIC_RAM', '384'), '-display', os.environ.get('CIC_DISPLAY', 'none'), '-monitor', mon,
            # SCIF0 (/dev/ser2) é a UART do GPS (o vdev-flexgps lê NMEA dela): socket sem log; SCIF1 (/dev/ser1) o console ksh; SCIF2 (/dev/ser3) o log do slog
-           '-chardev', 'socket,id=s0,path=%s/ser0.sock,server=on,wait=off' % run, '-serial', 'chardev:s0',
-           '-chardev', 'socket,id=s1,path=%s/ser1.sock,server=on,wait=off,logfile=%s/ser1.log' % (run, run), '-serial', 'chardev:s1',
+           '-chardev', s0, '-serial', 'chardev:s0',
+           '-chardev', s1, '-serial', 'chardev:s1',
            '-serial', 'file:%s/ser0.txt' % run]
     if dl:
         cmd += ['-d', dl, '-D', run + '/log.txt'] + (['-dfilter', os.environ['CIC_FILTER']] if os.environ.get('CIC_FILTER') else [])
-    drive = 'if=pflash,format=raw,file=%s' % flash if flash else 'if=pflash,format=raw,file=%s/flash.img,snapshot=on' % D
-    cmd += ['-drive', drive, '-device', 'loader,file=%s/ifs.bin,addr=0x08010000,force-raw=on' % D, '-device', 'loader,addr=0x880138e0,cpu-num=0'] + (['-device', 'loader,file=%s,addr=0x12c00000,force-raw=on' % os.environ['CIC_EFS']] if os.environ.get('CIC_EFS') else [])
+    drive = 'if=pflash,format=raw,file=%s' % q(flash) if flash else 'if=pflash,format=raw,file=%s/flash.img,snapshot=on' % q(D)
+    cmd += ['-drive', drive, '-device', 'loader,file=%s/ifs.bin,addr=0x08010000,force-raw=on' % q(D), '-device', 'loader,addr=0x880138e0,cpu-num=0'] + (['-device', 'loader,file=%s,addr=0x12c00000,force-raw=on' % q(os.environ['CIC_EFS'])] if os.environ.get('CIC_EFS') else [])
     if os.environ.get('CIC_XARGS'):
         cmd += os.environ['CIC_XARGS'].split()
     return cmd
@@ -206,14 +228,15 @@ def start():
     stop()
     prepare(D)
     cmd = qemu_cmd(D)
-    p = subprocess.Popen(cmd, stdout=open(D + '/out.txt', 'w'), stderr=subprocess.STDOUT, start_new_session=True)
+    kw = {'creationflags': 0x08000000} if IS_WIN else {'start_new_session': True}      # Windows: sem janela de console
+    p = subprocess.Popen(cmd, stdout=open(D + '/out.txt', 'w'), stderr=subprocess.STDOUT, **kw)
     open(D + '/qemu.pid', 'w').write(str(p.pid))
     print('qemu pid', p.pid)
 
 def stop():
     try:
         pid = int(open(D + '/qemu.pid').read())
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, getattr(signal, 'SIGKILL', signal.SIGTERM))      # Windows não tem SIGKILL (o os.kill dela encerra o processo)
     except Exception:
         pass
 

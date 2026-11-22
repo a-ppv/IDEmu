@@ -4,7 +4,7 @@ Saída em <env>/images/:  boot.ifs  sda.img (QNX4, SO)  sdb.img (QNX6, dados do 
 O conteúdo de sda/sdb vem exclusivamente dos pacotes SWFL; a camada de tradução (bibliotecas do guest, scripts de init,
 tabela de codificação) fica em shim.img e é aplicada na inicialização em memória."""
 import struct, os, re, sys, json, time, hashlib, shutil, stat as st, zlib
-from . import swfl, ifs, codegen
+from . import swfl, ifs, codegen, hostos
 from .qnxfs import mkdisk, mkq6
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -125,7 +125,7 @@ def build(env, env_dir, log=print, progress=lambda pct, step: None):
         if _last[0] != (pct, step):
             _last[0] = (pct, step); _p(pct, step)
     t0 = time.time()
-    img_dir = os.path.join(env_dir, 'images'); work = os.path.join(env_dir, 'work')
+    img_dir = os.path.join(env_dir, 'images'); work = hostos.short_work(env_dir)   # Windows: pasta curta (MAX_PATH de 260)
     shutil.rmtree(work, ignore_errors=True); os.makedirs(work); os.makedirs(img_dir, exist_ok=True)
     sw = env['swfl']
     for role in ('os', 'brand', 'hmi'):

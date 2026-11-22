@@ -136,6 +136,7 @@ class GuestFilesTest(unittest.TestCase):
         self.assertIn(b'clock_gettime', d); self.assertIn(b'gettimeofday', d); self.assertNotIn(b'libc.so', d)  # sem dependências
         self.assertEqual(mgu7.GUEST_FILES['libfastclock.so'], 'usr/lib/idemu/libfastclock.so')
 
+    @unittest.skipIf(not __import__('shutil').which('sh'), 'sem sh no Windows')
     def test_init_script_is_valid_shell_and_has_no_long_fixed_sleeps(self):
         p = os.path.join(mgu7.TOOLS, 'idemu-init.sh')
         self.assertEqual(subprocess.run(['sh', '-n', p], capture_output=True).returncode, 0)
@@ -176,6 +177,7 @@ class SnapshotTest(unittest.TestCase):
         for f in ('disk.qcow2', 'gl.rec'): open(os.path.join(rt.snap_dir, f), 'wb').write(b'x' * 10)
         json.dump(rt.snap_stamps(), open(os.path.join(rt.snap_dir, 'meta.json'), 'w'))
 
+    @unittest.skipIf(__import__('os').name == 'nt', 'boot rapido do iDrive 7 desligado no Windows')
     def test_valid_when_everything_matches(self):
         rt = self.rt(); self.assertFalse(rt.snap_valid()); self.save(rt)
         self.assertTrue(rt.snap_valid()); i = rt.snapshot_info(); self.assertEqual((i['valid'], i['enabled'], i['size'] > 0), (True, True, True))

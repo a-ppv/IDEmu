@@ -2,6 +2,7 @@
 """Monta o iDrive 8 (MGU22) a partir da PSdZData, sem alterá-la. Saída em <projeto>/mgu22 (cerca de 2,5 GB).
 Uso: build_image.py [psdzdata] [--car g70bev]  (o carro precisa bater com SERIES em MGU22_Coding.txt)"""
 import gzip, json, os, shutil, stat, struct, subprocess, sys, tarfile, tempfile
+import posixpath
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(ROOT, 'mgu22')
@@ -19,6 +20,28 @@ def member(tarpath, name, dst):
 
 def ext2cpio(img, cpio, src='/', pfx=''):
     subprocess.check_call([sys.executable, os.path.join(HERE, 'ext2cpio.py'), img, cpio, src, pfx])
+
+def msys_bash():
+    """Windows: o bash do MSYS2 (o do System32 é o do WSL e não serve). Procura em IDEMU_MSYS2 e nas pastas usuais."""
+    roots = [os.environ.get('IDEMU_MSYS2'), os.path.join(os.environ.get('SystemDrive', 'C:') + os.sep, 'msys64'), os.path.expanduser('~/msys64'), r'C:\msys64']
+    for r in roots:
+        if r:
+            b = os.path.join(r, 'usr', 'bin', 'bash.exe')
+            if os.path.isfile(b): return b
+    raise RuntimeError('MSYS2 não encontrado (procurei IDEMU_MSYS2 e C:\\msys64): instale o MSYS2 e rode windows\\build-native.sh, ou defina IDEMU_MSYS2')
+
+def build_guest(sysroot, gdir):
+    """Compila as peças do guest (aarch64) e do host. macOS: src/mgu22/build.sh (zsh). Windows: src/mgu22/build-windows.sh no shell MINGW64 do MSYS2 (clang + ld.lld + gcc)."""
+    if os.name != 'nt':
+        subprocess.check_call(['zsh', os.path.join(ROOT, 'src/mgu22/build.sh'), sysroot, gdir])
+        return
+    fw = lambda p: os.path.abspath(p).replace('\\', '/')
+    env = dict(os.environ, MSYSTEM='MINGW64', CHERE_INVOKING='1', PYTHON=fw(sys.executable), PYTHONUTF8='1')
+    # captura a saída: sem console (CREATE_NO_WINDOW) o bash do MSYS2 não repassa o stderr ao log do IDEmu, e uma falha ficaria sem mensagem
+    r = subprocess.run([msys_bash(), '-l', fw(os.path.join(ROOT, 'src/mgu22/build-windows.sh')), fw(sysroot), fw(gdir)], env=env, creationflags=0x08000000,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+    print(r.stdout[-3000:], flush=True)
+    if r.returncode: raise RuntimeError('a compilação do guest falhou (código %d): %s' % (r.returncode, ' / '.join(r.stdout.strip().splitlines()[-4:])))
 
 def main():
     psdz = next((a for a in sys.argv[1:] if not a.startswith('--')), None)
@@ -46,16 +69,18 @@ def main():
         def grab(e, p, dst):
             t = e.inode(e.lookup(p))
             while stat.S_ISLNK(e.mode(t)):
-                p = os.path.join(os.path.dirname(p), e.data(t).decode()); t = e.inode(e.lookup(p))
-            open(dst, 'wb').write(e.data(t))
+                p = posixpath.join(posixpath.dirname(p), e.data(t).decode()); t = e.inode(e.lookup(p))      # caminhos do guest: sempre com /
+            with open(dst, 'wb') as o: o.write(e.data(t))
         grab(r, '/lib/libc.so.6', sysroot + '/lib/libc.so.6')
         for n in ('libwayland-client.so.0', 'libwayland-server.so.0', 'libivi-application.so.1', 'libivi-controller.so.1', 'libdbus-1.so.3'):
             grab(r, '/usr/lib/' + n, sysroot + '/usr/lib/' + n)
         grab(r, '/usr/share/sysfunc/coding/cafd_mgu_02_a.bin', tmp + '/cafd.bin')
+        r.close()                                   # Windows: não apaga arquivo aberto (root.raw é apagado mais adiante)
         iv = E4(tmp + '/ivi.raw')
         grab(iv, '/rootfs/usr/share/hmi/data/ro/MGU22_Coding.txt', tmp + '/coding.txt')
+        iv.close()
         gdir = OUT + '/guest'; os.makedirs(gdir, exist_ok=True)
-        subprocess.check_call(['zsh', os.path.join(ROOT, 'src/mgu22/build.sh'), sysroot, gdir])
+        build_guest(sysroot, gdir)
         subprocess.check_call([sys.executable, os.path.join(HERE, 'gencoding.py'), tmp + '/cafd.bin', tmp + '/coding.txt', gdir + '/coding.tab'])
         import gen_coding8; gen_coding8.write(gen_coding8.build(tmp + '/cafd.bin', tmp + '/coding.txt'), OUT + '/coding8.json')
         print('cpio')

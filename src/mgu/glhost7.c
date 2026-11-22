@@ -1,20 +1,28 @@
 // glhost7: renderizador no Mac para o iDrive 7. Recebe o fluxo EGL/GLES3 do guest (gles_guest.c) por um socket
 // unix do QEMU (ttyS1), executa em OpenGL 4.1 core (CGL, fora da tela) e grava cada quadro em <saida>/frame.rgba.
-// Uso: glhost7 <socket do QEMU> <pasta de saída>
+// Uso: glhost7 <socket do QEMU | shm:/nome> <pasta de saída> [--replay arquivo]
+// Windows (MSYS2 MINGW64, ver build-windows.sh): o mesmo renderizador com contexto WGL 4.1 core numa janela oculta (GLEW), anel em memória compartilhada
+// NOMEADA do Windows ("shm:/nome" -> "Local\nome", criada pelo QEMU), socket do QEMU = TCP "127.0.0.1:porta", quadro em frame.rgba mapeado por CreateFileMapping,
+// e sem sinais: o fim da gravação do fluxo (SIGUSR1 no macOS) é pedido pelo arquivo <GLHOST7_REC>.stop.
 #define GL_SILENCE_DEPRECATION 1
+#ifdef _WIN32
+#include "winport7.h"
+#else
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
-#include <stdio.h>
-#include <ctype.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <signal.h>
+#endif
+#include <stdio.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <errno.h>
@@ -22,7 +30,30 @@
 #include "gl_ids.h"
 
 typedef unsigned char u8; typedef unsigned int u32; typedef unsigned long long u64; typedef long long i64;
-static int sock = -1;
+#ifdef _WIN32
+typedef SOCKET sock_t;
+#define BADSOCK INVALID_SOCKET
+#define SK_RECV(s, p, n) recv((s), (char *)(p), (int)(n), 0)
+#define SK_SEND(s, p, n) send((s), (const char *)(p), (int)(n), 0)
+#define FSEEK64 _fseeki64
+#define FTELL64 _ftelli64
+// placas híbridas (Optimus/PowerXpress): pede a GPU de alto desempenho para este processo
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#else
+typedef int sock_t;
+#define BADSOCK (-1)
+#define SK_RECV(s, p, n) read((s), (p), (n))
+#define SK_SEND(s, p, n) write((s), (p), (n))
+#define FSEEK64 fseek
+#define FTELL64 ftell
+#endif
+#if defined(__x86_64__) || defined(__i386__)
+#define CPU_RELAX() __asm__ volatile("pause" ::: "memory")
+#else
+#define CPU_RELAX() __asm__ volatile("yield" ::: "memory")
+#endif
+static sock_t sock = BADSOCK;
 static GLuint *idmap;                                 // id do guest -> id real (um espaço só: o contador do guest é único)
 #define IDMAX (1 << 22)
 static GLuint M(u32 id) { return id < IDMAX ? idmap[id] : 0; }
@@ -33,7 +64,11 @@ static char outdir[512]; static u8 *frame; static int *shm_hdr; static u8 *shm; 
 static u64 unknown_ops[64]; static u64 n_draws, n_clears; static u64 replay_swaps;
 // perfil (GLHOST7_PROF=1): por operação, quantidade, bytes de carga, tempo gasto no GL e respostas síncronas
 static int prof; static u64 p_cnt[64], p_bytes[64], p_ns[64], p_sync[64], p_idle_ns, p_rbytes; static i64 p_last;
+#ifdef _WIN32
+static u64 nsec(void) { static LARGE_INTEGER f; LARGE_INTEGER c; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return (u64)((double)c.QuadPart * 1e9 / (double)f.QuadPart); }
+#else
 static u64 nsec(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (u64)t.tv_sec * 1000000000ull + t.tv_nsec; }
+#endif
 static void prof_dump(void) {
   static const char *nm[] = {"NOP","INIT_SURFACE","SWAP","GEN","DELETE","CREATE_SHADER","CREATE_PROGRAM","DELETE_SHADER","DELETE_PROGRAM","SIMPLE","SHADER_SOURCE","BUFFER_DATA","TEX_IMAGE","TEX_SUBIMAGE","COMPRESSED_SUBIMAGE","UNIFORMV","DRAW_BUFFERS","GET_INTEGERV","GET_SHADERIV","GET_PROGRAMIV","GET_SHADER_LOG","GET_PROGRAM_LOG","GET_ATTRIB_LOC","GET_UNIFORM_LOC","CHECK_FB","READ_PIXELS","FINISH","BUFFER_SUBDATA"};
   u64 tb = 0, ts = 0, tn = 0; fprintf(stderr, "PROF ---- ocioso %.1fs\n", p_idle_ns / 1e9);
@@ -44,10 +79,23 @@ static void prof_dump(void) {
 static void die(const char *m) { fprintf(stderr, "glhost7: %s\n", m); exit(1); }
 // ---- transporte: anel em memória compartilhada (shm:/nome, dispositivo idemu-shm do QEMU) ou socket unix (serial do QEMU) ----
 static struct shm_hdr *H; static u8 *gdat, *hdat; static u64 gh, ht; static unsigned my_epoch; static jmp_buf resync;
+#ifdef _WIN32
+// o longjmp do UCRT/MinGW-w64 desenrola a pilha por SEH (RtlUnwindEx) e com -O2 cai fora da pilha (violação de acesso): usa os built-ins do GCC, que só restauram pilha e PC
+static void *resync_buf[5]; static volatile int resync_code;
+#define RESYNC_SET()    (__builtin_setjmp(resync_buf) ? resync_code : 0)
+#define RESYNC_JUMP(c)  do { resync_code = (c); __builtin_longjmp(resync_buf, 1); } while (0)
+#else
+#define RESYNC_SET()    setjmp(resync)
+#define RESYNC_JUMP(c)  longjmp(resync, (c))
+#endif
 // ---- snapshot: o fluxo recebido do guest é gravado (GLHOST7_REC=arquivo) e, ao restaurar a VM, reexecutado (--replay arquivo) para recriar o estado do GL no Mac ----
 static FILE *rec; static volatile sig_atomic_t stop_rec; static char rec_path[600];
 static u8 *rep_buf; static size_t rep_len, rep_pos; static int replaying, at_hdr, adopt;
+#ifdef _WIN32
+static char stop_path[640];                           // sem SIGUSR1: o IDEmu cria <GLHOST7_REC>.stop para pedir o fim da gravação (conferido em idle_wait)
+#else
 static void on_usr1(int s) { (void)s; stop_rec = 1; }
+#endif
 static void rec_close(void) {
   if (!rec) return;
   fclose(rec); rec = NULL; char p[640]; snprintf(p, sizeof p, "%s.done", rec_path); FILE *f = fopen(p, "w"); if (f) { fputs("ok\n", f); fclose(f); }
@@ -56,7 +104,21 @@ static void rec_close(void) {
 static void idle_wait(unsigned *n) {                 // espera curta: gira um pouco (latência baixa quando o guest está ativo) e depois dorme
   if (H && at_hdr) H->host_idle = 1;
   if (stop_rec && at_hdr) rec_close();
-  if (++*n < 400) { __asm__ volatile("yield" ::: "memory"); return; }
+#ifdef _WIN32
+  // Sleep() tem granularidade de ~1 ms (timeBeginPeriod em main): gira mais (pause), cede a vez e só então dorme 1 ms
+  if (++*n < 2000) { CPU_RELAX(); return; }
+  if (rec && !stop_rec && (*n & 63) == 0 && GetFileAttributesA(stop_path) != INVALID_FILE_ATTRIBUTES) stop_rec = 1;
+  if (*n < 2200) { SwitchToThread(); return; }
+  Sleep(1);
+}
+static void shm_open_ring(const char *name) {
+  void *m = w7_open_shm(name, SHM_SIZE);               // "Local\<nome>": o QEMU cria o mapeamento ao subir
+  if (!m) die("memória compartilhada não encontrada (o QEMU com o dispositivo idemu-shm não subiu?)");
+  H = m; gdat = (u8 *)m + G_OFF; hdat = (u8 *)m + H_OFF;
+  fprintf(stderr, "glhost7: anel %s mapeado\n", name);
+}
+#else
+  if (++*n < 400) { CPU_RELAX(); return; }
   if (*n < 4000) { usleep(30); return; }
   usleep(600);
 }
@@ -69,6 +131,7 @@ static void shm_open_ring(const char *name) {
   close(fd); H = m; gdat = (u8 *)m + G_OFF; hdat = (u8 *)m + H_OFF;
   fprintf(stderr, "glhost7: anel %s mapeado\n", name);
 }
+#endif
 static int ring_sync(void) {                         // o guest reiniciou o fluxo (processo novo): descarta o que ficou pela metade
   if (replaying) return 0;
   unsigned e = H->epoch; if (e == my_epoch) return 0;
@@ -76,15 +139,15 @@ static int ring_sync(void) {                         // o guest reiniciou o flux
 }
 static void rdn(void *p, size_t n) {
   if (replaying) {
-    if (rep_pos >= rep_len && n == 8) { replaying = 0; longjmp(resync, 2); }          // fim da gravação, na fronteira de uma mensagem
+    if (rep_pos >= rep_len && n == 8) { replaying = 0; RESYNC_JUMP(2); }          // fim da gravação, na fronteira de uma mensagem
     if (rep_pos + n > rep_len) die("gravação do fluxo truncada");
     memcpy(p, rep_buf + rep_pos, n); rep_pos += n; return;
   }
-  if (!H) { u8 *d = p; while (n) { ssize_t r = read(sock, d, n); if (r <= 0) die("socket fechado"); d += r; n -= r; } return; }
+  if (!H) { u8 *d = p; while (n) { ssize_t r = SK_RECV(sock, d, n); if (r <= 0) die("socket fechado"); d += r; n -= r; } return; }
   u8 *d = p; unsigned w = 0;
   while (n) {
     if (H->magic != SHM_MAGIC) { idle_wait(&w); continue; }
-    if (ring_sync()) longjmp(resync, 1);
+    if (ring_sync()) RESYNC_JUMP(1);
     u64 av = H->g_tail - gh;
     if (!av) { idle_wait(&w); continue; }
     w = 0; __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -97,11 +160,11 @@ static void rdn(void *p, size_t n) {
 }
 static void wrn(const void *p, size_t n) {
   if (replaying) return;
-  if (!H) { const u8 *s = p; while (n) { ssize_t r = write(sock, s, n); if (r <= 0) die("escrita falhou"); s += r; n -= r; } return; }
+  if (!H) { const u8 *s = p; while (n) { ssize_t r = SK_SEND(sock, s, n); if (r <= 0) die("escrita falhou"); s += r; n -= r; } return; }
   const u8 *s = p; unsigned w = 0;
   while (n) {
     u64 used = ht - H->h_head;
-    if (used >= H_SIZE) { idle_wait(&w); if (ring_sync()) longjmp(resync, 1); continue; }
+    if (used >= H_SIZE) { idle_wait(&w); if (ring_sync()) RESYNC_JUMP(1); continue; }
     w = 0; size_t c = H_SIZE - (size_t)used; if (c > n) c = n; size_t off = (size_t)(ht & (H_SIZE - 1)), seg = H_SIZE - off; if (seg > c) seg = c;
     memcpy(hdat + off, s, seg); if (c > seg) memcpy(hdat, s + seg, c - seg);
     ht += c; s += c; n -= c; __atomic_thread_fence(__ATOMIC_RELEASE); H->h_tail = ht;
@@ -285,6 +348,35 @@ static void del1(int kind, GLuint r) {
   case 3: glDeleteRenderbuffers(1, &r); break; case 4: glDeleteSamplers(1, &r); break; case 5: glDeleteVertexArrays(1, &r); break; }
 }
 
+#ifdef _WIN32
+// Windows: contexto OpenGL 4.1 core fora da tela = janela oculta (nunca mostrada) + WGL. Primeiro um contexto comum (obrigatório para obter
+// wglCreateContextAttribsARB), depois o 4.1 core, e GLEW carrega as funções. O quadro sai por glReadPixels do FBO, então nada é desenhado na janela.
+typedef HGLRC (WINAPI *w7_create_ctx_attribs)(HDC, HGLRC, const int *);
+static LRESULT CALLBACK w7_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcA(h, m, w, l); }
+static void init_gl(void) {
+  WNDCLASSA wc; memset(&wc, 0, sizeof wc); wc.style = CS_OWNDC; wc.lpfnWndProc = w7_wndproc; wc.hInstance = GetModuleHandleA(NULL); wc.lpszClassName = "idemu_glhost7";
+  if (!RegisterClassA(&wc)) die("RegisterClass falhou");
+  HWND wnd = CreateWindowExA(0, wc.lpszClassName, "glhost7", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, NULL, NULL, wc.hInstance, NULL);
+  if (!wnd) die("CreateWindow falhou");
+  HDC dc = GetDC(wnd);
+  PIXELFORMATDESCRIPTOR pfd; memset(&pfd, 0, sizeof pfd); pfd.nSize = sizeof pfd; pfd.nVersion = 1; pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+  pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32; pfd.cDepthBits = 24; pfd.cStencilBits = 8; pfd.iLayerType = PFD_MAIN_PLANE;
+  int pf = ChoosePixelFormat(dc, &pfd); if (!pf || !SetPixelFormat(dc, pf, &pfd)) die("sem formato de pixel OpenGL (driver da placa de vídeo instalado?)");
+  HGLRC tmp = wglCreateContext(dc); if (!tmp || !wglMakeCurrent(dc, tmp)) die("wglCreateContext falhou");
+  w7_create_ctx_attribs cca = (w7_create_ctx_attribs)wglGetProcAddress("wglCreateContextAttribsARB");
+  if (!cca) die("o driver não tem wglCreateContextAttribsARB: precisa de OpenGL 4.1 (instale o driver da placa de vídeo; o OpenGL genérico da Microsoft não serve)");
+  const int at[] = { 0x2091 /*WGL_CONTEXT_MAJOR_VERSION_ARB*/, 4, 0x2092 /*MINOR*/, 1, 0x9126 /*WGL_CONTEXT_PROFILE_MASK_ARB*/, 0x00000001 /*CORE*/, 0 };
+  HGLRC rc = cca(dc, NULL, at); if (!rc) die("o driver não criou um contexto OpenGL 4.1 core");
+  wglMakeCurrent(NULL, NULL); wglDeleteContext(tmp);
+  if (!wglMakeCurrent(dc, rc)) die("wglMakeCurrent falhou");
+  glewExperimental = GL_TRUE; GLenum ge = glewInit();
+  if (ge != GLEW_OK) { fprintf(stderr, "glhost7: glewInit: %s\n", (const char *)glewGetErrorString(ge)); exit(1); }
+  while (glGetError() != GL_NO_ERROR) {}               // o glewInit em contexto core deixa um GL_INVALID_ENUM (glGetString(GL_EXTENSIONS))
+  fprintf(stderr, "glhost7: %s | %s\n", glGetString(GL_RENDERER), glGetString(GL_VERSION));
+  glGenVertexArrays(1, &vao0); glBindVertexArray(vao0);
+  glEnable(GL_PROGRAM_POINT_SIZE);
+}
+#else
 static void init_gl(void) {
   CGLPixelFormatAttribute at[] = { kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core, kCGLPFAAccelerated, kCGLPFAColorSize, (CGLPixelFormatAttribute)24, (CGLPixelFormatAttribute)0 };
   CGLPixelFormatObj pf; GLint n; if (CGLChoosePixelFormat(at, &pf, &n) || !pf) die("sem formato de pixel GL 4.1");
@@ -293,6 +385,7 @@ static void init_gl(void) {
   glGenVertexArrays(1, &vao0); glBindVertexArray(vao0);
   glEnable(GL_PROGRAM_POINT_SIZE);
 }
+#endif
 
 static void init_surface(u32 id, int w, int h) {
   (void)id;
@@ -308,38 +401,83 @@ static void init_surface(u32 id, int w, int h) {
   free(frame); frame = malloc((size_t)w * h * 4);
   // o arquivo só cresce (sem O_TRUNC): o IDEmu (Python) o mantém mapeado, e um arquivo encolhido sob o mapeamento derruba o servidor com SIGBUS
   size_t need = 64 + (size_t)w * h * 4; char p[600]; snprintf(p, sizeof p, "%s/frame.rgba", outdir);
+#ifdef _WIN32
+  // CreateFileMapping (winport7.h): o arquivo nunca encolhe (mínimo de 1920x1080) e a visão antiga só é solta depois da nova
+  { static int first = 1; size_t got = 0; void *v = w7_map_frame(p, need, &got);
+    if (!v) die("glhost7: não deu para mapear frame.rgba");
+    shm = v; shm_size = got; if (first) { memset(shm, 0, 64); first = 0; } }      // arquivo de uma execução anterior (que o IDEmu não conseguiu apagar): não herda o seq velho
+#else
   int fd = open(p, O_RDWR | O_CREAT, 0644); struct stat st;
   if (fd < 0 || fstat(fd, &st) != 0 || ((size_t)st.st_size < need && ftruncate(fd, need) != 0)) die("glhost7: não deu para criar frame.rgba");
   if (shm) munmap(shm, shm_size);
   shm_size = need > (size_t)st.st_size ? need : (size_t)st.st_size;
   shm = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); close(fd);
   if (shm == MAP_FAILED) die("glhost7: mmap de frame.rgba falhou");
+#endif
   shm_hdr = (int *)shm; shm_hdr[0] = w; shm_hdr[1] = h; shm_hdr[3] = shm_hdr[2]; frames = (u32)shm_hdr[2];   // seq continua de onde estava
   fprintf(stderr, "glhost7: superfície %dx%d\n", w, h);
 }
 
+#ifdef _WIN32
+// Falha de proteção (0xC0000005 etc.): imprime o código, o endereço e a pilha (como deslocamentos do .exe: addr2line -e glhost7.exe -f <0x140000000+desl>) e encerra
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
+  static int shown = 0; EXCEPTION_RECORD *er = ep->ExceptionRecord; if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && er->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION && er->ExceptionCode != EXCEPTION_STACK_OVERFLOW && er->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO) return EXCEPTION_CONTINUE_SEARCH; { static void *seen[16]; int k; for (k = 0; k < shown && k < 16; k++) if (seen[k] == er->ExceptionAddress) return EXCEPTION_CONTINUE_SEARCH; if (shown >= 16) return EXCEPTION_CONTINUE_SEARCH; seen[shown++] = er->ExceptionAddress; } char *base = (char *)GetModuleHandleA(NULL); void *fr[32]; int n, i;
+  fprintf(stderr, "glhost7: EXCECAO 0x%08lx em desl 0x%llx", (unsigned long)er->ExceptionCode, (unsigned long long)((char *)er->ExceptionAddress - base));
+  if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) fprintf(stderr, " (%s %p)", er->ExceptionInformation[0] == 0 ? "leitura de" : er->ExceptionInformation[0] == 1 ? "escrita em" : "execucao de", (void *)er->ExceptionInformation[1]);
+  fprintf(stderr, "\n");
+  n = CaptureStackBackTrace(0, 12, fr, NULL);
+  for (i = 0; i < n; i++) fprintf(stderr, "glhost7:   #%d desl 0x%llx\n", i, (unsigned long long)((char *)fr[i] - base));
+  fflush(stderr); return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc < 3) die("uso: glhost7 <socket|shm:nome> <pasta> [--replay arquivo]");
-  strncpy(outdir, argv[2], sizeof outdir - 1); mkdir(outdir, 0755); verbose = getenv("GLHOST7_VERBOSE") != NULL; prof = getenv("GLHOST7_PROF") != NULL;
+  strncpy(outdir, argv[2], sizeof outdir - 1);
+#ifdef _WIN32
+  AddVectoredExceptionHandler(1, crash_filter);       /* vetorial: o driver da placa de vídeo troca o SetUnhandledExceptionFilter */
+  { WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa); } timeBeginPeriod(1); _mkdir(outdir);
+#else
+  mkdir(outdir, 0755);
+#endif
+  verbose = getenv("GLHOST7_VERBOSE") != NULL; prof = getenv("GLHOST7_PROF") != NULL;
   idmap = calloc(IDMAX, 4); init_gl();
+#ifndef _WIN32
   signal(SIGUSR1, on_usr1);
+#endif
   const char *rp = getenv("GLHOST7_REC");
   if (rp && !strncmp(argv[1], "shm:", 4)) { snprintf(rec_path, sizeof rec_path, "%s", rp); rec = fopen(rp, "wb"); if (rec) setvbuf(rec, NULL, _IOFBF, 1 << 20); }
+#ifdef _WIN32
+  snprintf(stop_path, sizeof stop_path, "%s.stop", rec_path);                  // vazio sem GLHOST7_REC: o ".stop" avulso nunca existe e nada é conferido (rec == NULL)
+#endif
   for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], "--replay")) {            // restaurar: reexecuta o fluxo gravado antes de adotar o anel
     FILE *f = fopen(argv[i + 1], "rb"); if (!f) die("gravação do fluxo não abriu");
-    fseek(f, 0, SEEK_END); rep_len = (size_t)ftell(f); fseek(f, 0, SEEK_SET); rep_buf = malloc(rep_len ? rep_len : 1);
+    FSEEK64(f, 0, SEEK_END); rep_len = (size_t)FTELL64(f); FSEEK64(f, 0, SEEK_SET); rep_buf = malloc(rep_len ? rep_len : 1);
     if (fread(rep_buf, 1, rep_len, f) != rep_len) die("gravação do fluxo incompleta"); fclose(f); replaying = 1; adopt = 1;
     fprintf(stderr, "glhost7: reproduzindo %zu bytes do fluxo\n", rep_len);
   }
   if (!strncmp(argv[1], "shm:", 4)) shm_open_ring(argv[1] + 4);
   else {
+#ifdef _WIN32
+    // sem o dispositivo idemu-shm o QEMU serve a serial do canal GL em TCP "127.0.0.1:porta" (o IDEmu passa o endereço em argv[1])
+    struct sockaddr_in sa; if (!win_parse_addr(argv[1], &sa)) die("endereço do QEMU inválido (esperado 127.0.0.1:porta)");
+    for (int i = 0;; i++) {
+      sock = socket(AF_INET, SOCK_STREAM, 0);
+      if (sock != INVALID_SOCKET && !connect(sock, (struct sockaddr *)&sa, sizeof sa)) break;
+      if (sock != INVALID_SOCKET) closesocket(sock);
+      if (i > 600) die("não conectou ao QEMU");
+      Sleep(100);
+    }
+    win_nodelay(sock);
+#else
     struct sockaddr_un sa; memset(&sa, 0, sizeof sa); sa.sun_family = AF_UNIX; strncpy(sa.sun_path, argv[1], sizeof sa.sun_path - 1);
     sock = socket(AF_UNIX, SOCK_STREAM, 0);
     for (int i = 0;; i++) { if (!connect(sock, (struct sockaddr *)&sa, sizeof sa)) break; if (i > 600) die("não conectou ao QEMU"); usleep(100000); }
+#endif
     fprintf(stderr, "glhost7: conectado a %s\n", argv[1]);
   }
   static u8 *buf; static size_t cap; static time_t tlog; buf = malloc(1 << 20); cap = 1 << 20; tlog = time(0);
-  if (setjmp(resync) == 2) {                        // fim da reprodução: mostra o último quadro e passa a ler o anel de onde a VM parou
+  if (RESYNC_SET() == 2) {                        // fim da reprodução: mostra o último quadro e passa a ler o anel de onde a VM parou
     glFinish(); save_frame();
     for (int i = 0; i < 6000 && H->magic != SHM_MAGIC; i++) usleep(10000);
     my_epoch = H->epoch; gh = H->g_head; ht = H->h_tail;

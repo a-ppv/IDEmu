@@ -30,8 +30,13 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
+#ifdef _WIN32
+/* Windows nativo: CIC_INPUT / CIC_OUTPUT são endereços "127.0.0.1:porta" (UDP em loopback); o osdep.h do QEMU já traz o winsock2 */
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
 #include <sys/un.h>
+#endif
 #include "cic.h"
 
 #define RAM_BASE   0x08000000
@@ -175,6 +180,7 @@ static const MemoryRegionOps mmct_ops = {
  *   op 3/4/5: telegrama que o HMI enviou ao FBlock 0xE5 (início com r4 = tamanho; byte r5 no deslocamento r4; fim)
  * Os telegramas chegam pelo socket Unix de datagramas CIC_INPUT, uma linha por telegrama: "t <hex>" (o IDEmu monta os telegramas);
  * os enviados pelo HMI ao controlador saem como "x <hex>" para o socket CIC_OUTPUT (o controlador virtual do IDEmu responde).
+ * No Windows os dois são UDP em 127.0.0.1 (CIC_INPUT/CIC_OUTPUT = "127.0.0.1:porta"); o protocolo de bytes é o mesmo.
  * CIC_INPUT_DEBUG=1 mostra cada telegrama no stderr. */
 #define TEL_MAX 512
 #define TEL_Q 256
@@ -184,7 +190,47 @@ static unsigned telq_r, telq_w;
 static QemuMutex tel_lock;
 static uint32_t hc_this, hc_buf;
 static int in_fd = -1, out_fd = -1;
+#ifdef _WIN32
+static struct sockaddr_in out_addr;
+static QemuThread in_thread;
+/* "127.0.0.1:porta" -> sockaddr_in (sempre o loopback, seja qual for o host escrito) */
+static bool cic_parse_addr(const char *s, struct sockaddr_in *sa)
+{
+    const char *colon = s ? strrchr(s, ':') : NULL;
+    int port = colon ? atoi(colon + 1) : 0;
+    if (port <= 0 || port > 65535) {
+        return false;
+    }
+    memset(sa, 0, sizeof(*sa));
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons((unsigned short)port);
+    sa->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return true;
+}
+/* o mingw-w64 não garante strtok_r: mesma semântica (delimitadores consecutivos são pulados) */
+static char *cic_strtok_r(char *s, const char *delim, char **save)
+{
+    char *p = s ? s : *save, *tok;
+    if (!p) {
+        return NULL;
+    }
+    p += strspn(p, delim);
+    if (!*p) {
+        *save = NULL;
+        return NULL;
+    }
+    tok = p;
+    p += strcspn(p, delim);
+    if (*p) {
+        *p++ = 0;
+    }
+    *save = p;
+    return tok;
+}
+#else
 static struct sockaddr_un out_addr;
+#define cic_strtok_r strtok_r
+#endif
 static uint8_t tx_buf[TEL_MAX];
 static unsigned tx_len;
 static bool in_dbg;
@@ -233,6 +279,7 @@ static void cic_input_line(char *s)
     }
 }
 
+#ifndef _WIN32
 static void cic_input_read(void *opaque)
 {
     char b[4096], *save = NULL;
@@ -241,10 +288,35 @@ static void cic_input_read(void *opaque)
         return;
     }
     b[n] = 0;
-    for (char *l = strtok_r(b, "\r\n", &save); l; l = strtok_r(NULL, "\r\n", &save)) {
+    for (char *l = cic_strtok_r(b, "\r\n", &save); l; l = cic_strtok_r(NULL, "\r\n", &save)) {
         cic_input_line(l);
     }
 }
+#else
+/* Windows: thread própria com recv() bloqueante em vez de qemu_set_fd_handler (a lista de telegramas já é protegida por tel_lock) */
+static void *cic_input_thread(void *opaque)
+{
+    for (;;) {
+        char b[4096], *save = NULL;
+        int n = recv(in_fd, b, sizeof(b) - 1, 0);
+        if (n < 0) {
+            int e = WSAGetLastError();
+            if (e == WSAECONNRESET || e == WSAEMSGSIZE || e == WSAEINTR) {
+                continue;
+            }
+            break;
+        }
+        if (n == 0) {
+            continue;                                    /* datagrama vazio */
+        }
+        b[n] = 0;
+        for (char *l = cic_strtok_r(b, "\r\n", &save); l; l = cic_strtok_r(NULL, "\r\n", &save)) {
+            cic_input_line(l);
+        }
+    }
+    return NULL;
+}
+#endif
 
 /* telegrama que o HMI mandou ao FBlock 0xE5: vai como "x <hex>" para o socket CIC_OUTPUT (do IDEmu), se existir */
 static void cic_output_tel(void)
@@ -257,9 +329,16 @@ static void cic_output_tel(void)
     if (in_dbg) {
         fprintf(stderr, "cic: HMI enviou ao controlador: %s\n", line + 2);
     }
+#ifdef _WIN32
+    if (out_fd >= 0 && out_addr.sin_port) {
+        /* o socket de saída é não bloqueante (cic_input_init); o resultado é ignorado como no POSIX */
+        sendto(out_fd, line, n, 0, (const struct sockaddr *)&out_addr, sizeof(out_addr));
+    }
+#else
     if (out_fd >= 0 && out_addr.sun_path[0]) {
         sendto(out_fd, line, n, MSG_DONTWAIT, (struct sockaddr *)&out_addr, sizeof(out_addr));
     }
+#endif
 }
 
 static bool cic_hypercall(CPUSH4State *env)
@@ -326,6 +405,42 @@ static void cic_input_init(void)
     qemu_mutex_init(&tel_lock);
     in_dbg = getenv("CIC_INPUT_DEBUG") != NULL;
     sh4_cic_hypercall = cic_hypercall;
+#ifdef _WIN32
+    {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);                /* com contagem de uso: seguro mesmo que o QEMU já o tenha feito */
+    }
+    {
+        const char *op = getenv("CIC_OUTPUT");
+        if (op && *op && cic_parse_addr(op, &out_addr)) {
+            out_fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
+            if (out_fd >= 0) {
+                u_long nb = 1;
+                ioctlsocket(out_fd, FIONBIO, &nb);       /* sem MSG_DONTWAIT no Windows */
+            }
+        }
+    }
+    if (!path || !*path) {
+        return;
+    }
+    {
+        struct sockaddr_in sa;
+        if (!cic_parse_addr(path, &sa)) {
+            error_report("cic: CIC_INPUT inválido (esperado 127.0.0.1:porta): %s", path);
+            return;
+        }
+        in_fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
+        if (in_fd < 0 || bind(in_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            error_report("cic: não consegui abrir %s", path);
+            if (in_fd >= 0) {
+                closesocket(in_fd);
+            }
+            in_fd = -1;
+            return;
+        }
+        qemu_thread_create(&in_thread, "cic-input", cic_input_thread, NULL, QEMU_THREAD_DETACHED);
+    }
+#else
     {
         const char *op = getenv("CIC_OUTPUT");
         if (op && *op && strlen(op) < sizeof(out_addr.sun_path)) {
@@ -355,6 +470,7 @@ static void cic_input_init(void)
     }
     fcntl(in_fd, F_SETFL, fcntl(in_fd, F_GETFL) | O_NONBLOCK);
     qemu_set_fd_handler(in_fd, cic_input_read, NULL, NULL);
+#endif
 }
 
 /* ------------------------------------------------------------------ máquina */

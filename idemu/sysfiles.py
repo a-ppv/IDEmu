@@ -263,6 +263,11 @@ def reveal(env, env_dir, rel):
     try:
         d = _need(env, env_dir); p = resolve(d, rel)
     except ValueError as e: raise ApiError(str(e), 400)
+    from . import hostos
+    if not hostos.IS_MAC:
+        try: hostos.reveal(p, select=os.path.isfile(p))
+        except OSError as e: raise ApiError('não consegui abrir a pasta: %s' % str(e)[:160], 500)
+        return {'ok': True}
     r = subprocess.run(['open', '-R', p] if os.path.isfile(p) else ['open', p], capture_output=True, text=True)
     if r.returncode: raise ApiError('não consegui abrir o Finder: %s' % r.stderr.strip()[:160], 500)
     return {'ok': True}

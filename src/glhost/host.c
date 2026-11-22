@@ -5,6 +5,11 @@
 #include <OpenGL/gl.h>
 #include <OpenGL/glext.h>
 #include <OpenGL/OpenGL.h>
+#elif defined(_WIN32)
+#include "winport.h"           /* Windows nativo: winsock + GLEW (antes do GL) */
+#include <GL/glut.h>
+#include <GL/gl.h>
+#include <GL/glext.h>
 #else
 #define GL_GLEXT_PROTOTYPES 1
 #include <GL/glut.h>
@@ -15,10 +20,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef _WIN32
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#endif
 #include <strings.h>
 #include "glops.h"
 typedef unsigned int u32;
@@ -59,8 +66,10 @@ static void draw_panel(void);
 static void shot(void){ if(access(P("glshot.req"),F_OK)) return; unlink(P("glshot.req")); dump_stats();
   unsigned char *b=malloc(sw*sh*3); glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,screen_fbo); glPixelStorei(GL_PACK_ALIGNMENT,1); glReadPixels(0,0,sw,sh,GL_RGB,GL_UNSIGNED_BYTE,b); glPixelStorei(GL_PACK_ALIGNMENT,4);
   FILE*f=fopen(P("glshot.ppm"),"wb"); fprintf(f,"P6\n%d %d\n255\n",sw,sh); for(int y=sh-1;y>=0;y--) fwrite(b+y*sw*3,1,sw*3,f); fclose(f); free(b); fprintf(stderr,"[host] screenshot saved\n"); }
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <fcntl.h>
+#endif
 static unsigned char *fmap; static size_t fmaplen; static double fexp_t; static int fdirty;
 static int map_readback(unsigned char *out); static GLuint map_present_tex(void);
 static void export_frame(void){ if(!fmap) return; fdirty=1; struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); double t=ts.tv_sec+ts.tv_nsec*1e-9; if(t-fexp_t<0.033) return; fexp_t=t; fdirty=0; GLint sfbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT,&sfbo);
@@ -91,8 +100,8 @@ static void present(void){
   glPopClientAttrib(); glPopAttrib(); glUseProgram(prog); glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,fbo); glBindRenderbufferEXT(GL_RENDERBUFFER_EXT,rbo); glBindBuffer(GL_ARRAY_BUFFER,arr);
 }
 static void do_bindbuffer(u32 t,GLuint id){ if(t==GL_ARRAY_BUFFER) cur_arr=id; else if(t==GL_ELEMENT_ARRAY_BUFFER) cur_elem=id; glBindBuffer(t,id); }
-#define TEXT(t) ((t)==0x8D65?GL_TEXTURE_2D:(t))   /* GL_TEXTURE_EXTERNAL_OES (textura de superficie redirecionada) e uma textura comum aqui */
-static void do_texparam(u32 t,u32 pn,int v){ if(pn==0x84FE||pn==0x84FF) return; glTexParameteri(TEXT(t),pn,v); }
+#define GLTEX(t) ((t)==0x8D65?GL_TEXTURE_2D:(t))   /* GL_TEXTURE_EXTERNAL_OES (textura de superficie redirecionada) e uma textura comum aqui */
+static void do_texparam(u32 t,u32 pn,int v){ if(pn==0x84FE||pn==0x84FF) return; glTexParameteri(GLTEX(t),pn,v); }
 static u32 mapfmt(u32 f){ switch(f){ case 0x81A5:case 0x8D48:case 0x81A6: return GL_DEPTH24_STENCIL8_EXT; case 0x8056:case 0x8057: return GL_RGBA8; case 0x8D62: return GL_RGB8; } return f; }
 static void rb_storage(u32 t,u32 f,u32 w,u32 h){ GLint cur; glGetIntegerv(GL_RENDERBUFFER_BINDING_EXT,&cur); u32 nf=mapfmt(f); if(cur<65536) rb_ds[cur]=(nf==GL_DEPTH24_STENCIL8_EXT); glRenderbufferStorageEXT(t,nf,w,h); }
 static void fb_renderbuffer(u32 t,u32 att,u32 rbt,u32 rb){
@@ -168,12 +177,12 @@ static void process(u32 *w,u32 nbytes){
       if(isi){ switch(v){case 1:glUniform1iv(loc,c,d);break;case 2:glUniform2iv(loc,c,d);break;case 3:glUniform3iv(loc,c,d);break;default:glUniform4iv(loc,c,d);} }
       else { switch(v){case 1:glUniform1fv(loc,c,d);break;case 2:glUniform2fv(loc,c,d);break;case 3:glUniform3fv(loc,c,d);break;default:glUniform4fv(loc,c,d);} } break; }
     case OP_UNIFORMMATRIX:{ u32 loc=a[0],c=a[1],dim=a[2],tr=a[3]; const float*d=(float*)(a+4); if(dim==2)glUniformMatrix2fv(loc,c,tr,d); else if(dim==3)glUniformMatrix3fv(loc,c,tr,d); else glUniformMatrix4fv(loc,c,tr,d); break; }
-    case OP_ATTRIBPTR: glVertexAttribPointer(a[0],a[1],a[2],a[3],a[4],(void*)(unsigned long)a[5]); break;
+    case OP_ATTRIBPTR: glVertexAttribPointer(a[0],a[1],a[2],a[3],a[4],(void*)(uintptr_t)a[5]); break;
     case OP_CLIENTATTRIB:{ u32 i=a[0]; if(i>=16) break; if(!scratch_vbo[i]) glGenBuffers(1,&scratch_vbo[i]);
       glBindBuffer(GL_ARRAY_BUFFER,scratch_vbo[i]); glBufferData(GL_ARRAY_BUFFER,a[5],a+7,GL_STREAM_DRAW); glVertexAttribPointer(i,a[1],a[2],a[3],a[4],(void*)0); glBindBuffer(GL_ARRAY_BUFFER,cur_arr); break; }
     case OP_DRAWARRAYS: count_draw(); if(draw_ok()) glDrawArrays(a[0],a[1],a[2]); break;
     case OP_DRAWELEMENTS:{ count_draw(); if(!draw_ok()) break; if(a[3]){ if(!scratch_ebo) glGenBuffers(1,&scratch_ebo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,scratch_ebo); glBufferData(GL_ELEMENT_ARRAY_BUFFER,a[4],a+5,GL_STREAM_DRAW); glDrawElements(a[0],a[1],a[2],(void*)0); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,cur_elem); }
-      else glDrawElements(a[0],a[1],a[2],(void*)(unsigned long)a[4]); break; }
+      else glDrawElements(a[0],a[1],a[2],(void*)(uintptr_t)a[4]); break; }
     case OP_GETUNILOC:{ char nm[256]; u32 l=a[1]; if(l>255)l=255; memcpy(nm,a+2,l); nm[l]=0; reply_u32(glGetUniformLocation(H(4,a[0]),gname(nm))); break; }
     case OP_GETATTRLOC:{ char nm[256]; u32 l=a[1]; if(l>255)l=255; memcpy(nm,a+2,l); nm[l]=0; reply_u32(glGetAttribLocation(H(4,a[0]),nm)); break; }
     case OP_GETSHADERIV:{ GLint v=0; if(a[0]<MAXSH&&shinfo[a[0]]) v=(a[1]==GL_COMPILE_STATUS); else glGetShaderiv(H(4,a[0]),a[1],&v); reply_u32(v); break; }
@@ -212,7 +221,11 @@ static void idle(void){
   do {
     struct pollfd pf[2]; int n=0; pf[n].fd=lfd; pf[n].events=POLLIN; n++; if(cfd>=0){ pf[n].fd=cfd; pf[n].events=POLLIN; n++; }
     if(poll(pf,n,fdirty?1:4)<=0) return;
-    if(pf[0].revents&POLLIN){ int f=accept(lfd,0,0); if(f>=0){ if(cfd>=0) close(cfd); cfd=f; fprintf(stderr,"[host] guest connected\n"); } }
+    if(pf[0].revents&POLLIN){ int f=accept(lfd,0,0); if(f>=0){ if(cfd>=0) close(cfd); cfd=f;
+#ifdef _WIN32
+        win_nodelay(f);
+#endif
+        fprintf(stderr,"[host] guest connected\n"); } }
     if(n>1&&(pf[1].revents&(POLLIN|POLLHUP))){
       u32 len; if(rd(cfd,&len,4)){ close(cfd); cfd=-1; fprintf(stderr,"[host] guest disconnected\n"); return; }
       if(len>(64u<<20)){ fprintf(stderr,"[host] request too large (%u)\n",len); close(cfd); cfd=-1; return; }
@@ -235,10 +248,19 @@ int main(int argc,char**argv){
   glutInit(&argc,argv); verbose=getenv("GLHOST_VERBOSE")!=NULL; nogl=getenv("GLHOST_NOGL")!=NULL;
   const char*sc=getenv("GLHOST_SOCK"); if(sc) SOCK=sc;
   if(getenv("GLHOST_CTL")) CTL=getenv("GLHOST_CTL");
+#ifdef _WIN32
+  { WSADATA wd; WSAStartup(MAKEWORD(2,2),&wd); }
+  if(getenv("GLHOST_FRAME")){ fmaplen=32+1440*540*3; fmap=win_map_file(getenv("GLHOST_FRAME"),fmaplen); if(!fmap) fprintf(stderr,"[host] nao consegui mapear o arquivo do quadro (erro %lu)\n",GetLastError()); }
+#else
   if(getenv("GLHOST_FRAME")){ int ff=open(getenv("GLHOST_FRAME"),O_RDWR|O_CREAT,0644); fmaplen=32+1440*540*3; if(ff>=0&&ftruncate(ff,fmaplen)==0){ fmap=mmap(0,fmaplen,PROT_READ|PROT_WRITE,MAP_SHARED,ff,0); if(fmap==MAP_FAILED) fmap=0; } }
+#endif
   if(getenv("GLHOST_W")) winw=atoi(getenv("GLHOST_W")); if(getenv("GLHOST_H")) winh=atoi(getenv("GLHOST_H"));
   glutInitDisplayMode(GLUT_RGBA|GLUT_DOUBLE|GLUT_DEPTH|GLUT_STENCIL); glutInitWindowSize(winw,winh);
   glutCreateWindow("BMW iDrive 6 (QEMU OMAP5)"); glutDisplayFunc(display); glutReshapeFunc(reshape); glutIdleFunc(idle); glutMouseFunc(on_mouse); glutMotionFunc(on_motion); glutKeyboardFunc(on_key); glutKeyboardUpFunc(on_keyup); glutSpecialFunc(on_special); glutSpecialUpFunc(on_specialup); glutIgnoreKeyRepeat(1);
+#ifdef _WIN32
+  { glewExperimental=GL_TRUE; GLenum ge=glewInit(); if(ge!=GLEW_OK){ fprintf(stderr,"[host] glewInit falhou: %s\n",(const char*)glewGetErrorString(ge)); return 2; }
+    if(!GLEW_EXT_framebuffer_object&&!GLEW_ARB_framebuffer_object){ fprintf(stderr,"[host] o driver OpenGL nao tem framebuffer objects: instale o driver da placa de video\n"); return 2; } }
+#endif
   fprintf(stderr,"[host] GL_VERSION=%s RENDERER=%s\n",glGetString(GL_VERSION),glGetString(GL_RENDERER));
   load_index(); ensure_screen(1440,540); window_shown=getenv("GLHOST_SHOW")!=NULL; if(!window_shown) glutHideWindow();
 #ifdef __APPLE__
@@ -247,8 +269,15 @@ int main(int argc,char**argv){
   if(getenv("GLHOST_LOG_MB")) glog_max=atoll(getenv("GLHOST_LOG_MB"))<<20;
   if(getenv("GLHOST_REPLAY")&&replay_file(getenv("GLHOST_REPLAY"))) return 3;
   if(getenv("GLHOST_RECORD")){ recf=fopen(getenv("GLHOST_RECORD"),"wb"); if(recf){ static char rb[1<<20]; setvbuf(recf,rb,_IOFBF,sizeof rb); } }
+#ifdef _WIN32
+  { struct sockaddr_in ia; const char*ea=getenv("GLHOST_INPUT"); if(ea&&win_parse_addr(ea,&ia)){ ifd=(int)socket(AF_INET,SOCK_DGRAM,0); if(ifd>=0&&bind(ifd,(struct sockaddr*)&ia,sizeof ia)){ close(ifd); ifd=-1; } if(ifd>=0){ int rb=256*1024; setsockopt(ifd,SOL_SOCKET,SO_RCVBUF,(const char*)&rb,sizeof rb); win_nonblock(ifd); } } }
+  { struct sockaddr_in sa; if(!win_parse_addr(SOCK,&sa)){ fprintf(stderr,"[host] GLHOST_SOCK precisa ser 127.0.0.1:porta (veio '%s')\n",SOCK); return 1; }
+    lfd=(int)socket(AF_INET,SOCK_STREAM,0); if(bind(lfd,(struct sockaddr*)&sa,sizeof sa)||listen(lfd,1)){ fprintf(stderr,"[host] bind falhou (erro %d)\n",WSAGetLastError()); return 1; }
+    const char*rf=getenv("GLHOST_READY"); if(rf){ FILE*f=fopen(rf,"w"); if(f){ fputs("1",f); fclose(f); } } }
+#else
   { struct sockaddr_un ia={.sun_family=AF_UNIX}; snprintf(ia.sun_path,sizeof ia.sun_path,"%s",P("input.sock")); unlink(ia.sun_path); ifd=socket(AF_UNIX,SOCK_DGRAM,0); if(ifd>=0&&bind(ifd,(struct sockaddr*)&ia,sizeof ia)){ close(ifd); ifd=-1; } if(ifd>=0){ int rb=256*1024; setsockopt(ifd,SOL_SOCKET,SO_RCVBUF,&rb,sizeof rb); } }
   unlink(SOCK); lfd=socket(AF_UNIX,SOCK_STREAM,0); struct sockaddr_un sa={.sun_family=AF_UNIX}; strncpy(sa.sun_path,SOCK,sizeof sa.sun_path-1);
   if(bind(lfd,(struct sockaddr*)&sa,sizeof sa)||listen(lfd,1)){ perror("bind"); return 1; }
+#endif
   fprintf(stderr,"[host] listening on %s\n",SOCK);
   glutMainLoop(); return 0; }

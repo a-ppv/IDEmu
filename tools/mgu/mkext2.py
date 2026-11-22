@@ -11,10 +11,35 @@ Uso: mkext2.py PASTA imagem.img TAMANHO_MB [--root-owner]
 """
 import os, sys, stat, struct, time
 
+IS_WIN = os.name == 'nt'
+if IS_WIN:
+    # Windows: symlinks e modos não existem no disco; vêm do sidecar <raiz>/.idemu-meta.json (rootmeta.py, gravado por har.py e mgu7.build). Com `python -I` a pasta do
+    # script não entra no sys.path, daí o insert.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import rootmeta
+    L = rootmeta.lp
+else:
+    def L(p): return p
+
 BS = 4096
 INODE_SIZE = 128
 BPG = 8 * BS                # blocos por grupo (um bitmap de 1 bloco)
 FT = {stat.S_IFREG: 1, stat.S_IFDIR: 2, stat.S_IFCHR: 3, stat.S_IFBLK: 4, stat.S_IFIFO: 5, stat.S_IFSOCK: 6, stat.S_IFLNK: 7}
+
+
+def set_sparse(f):
+    """Windows: marca o arquivo como esparso (FSCTL_SET_SPARSE). Se não der, segue sem: só fica mais lento e ocupa os 4 GiB."""
+    try:
+        import ctypes, msvcrt
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        k32.DeviceIoControl.restype = wintypes.BOOL
+        got = wintypes.DWORD(0)
+        f.flush()
+        k32.DeviceIoControl(msvcrt.get_osfhandle(f.fileno()), 0x900C4, None, 0, None, 0, ctypes.byref(got), None)
+    except Exception:
+        pass
 
 
 class Img:
@@ -26,7 +51,9 @@ class Img:
         self.ninodes = ipg * self.ngroups
         self.itb = (ipg * INODE_SIZE + BS - 1) // BS                  # blocos da tabela de inodes por grupo
         self.gdtb = (self.ngroups * 32 + BS - 1) // BS
-        self.f = open(path, 'wb'); self.f.truncate(self.size)
+        self.f = open(path, 'wb')
+        if IS_WIN: set_sparse(self.f)                                   # NTFS: sem isto, gravar o fim dos 4 GiB escreve zeros em tudo que vem antes
+        self.f.truncate(self.size)
         self.free_blocks = [0] * self.ngroups
         self.bmap = [bytearray(BS) for _ in range(self.ngroups)]
         self.imap = [bytearray(BS) for _ in range(self.ngroups)]
@@ -153,11 +180,29 @@ def build(root, path, size_mb):
     links = {}                       # inode ext2 -> contagem de nomes
     total = [0]
 
+    meta = rootmeta.Meta(root) if IS_WIN else None      # Windows: symlinks e modos do sidecar
+
+    def put_symlink(ino, tgt, mtime):
+        if len(tgt) <= 59:
+            img.put_inode(ino, stat.S_IFLNK | 0o777, len(tgt), 0, tgt.ljust(60, b'\0'), 1, mtime)
+        else:
+            b = img.alloc(1)[0]; img.f.seek(b * BS); img.f.write(tgt.ljust(BS, b'\0'))
+            ib, _ = img.block_ptrs([b]); img.put_inode(ino, stat.S_IFLNK | 0o777, len(tgt), BS // 512, ib, 1, mtime)
+
+    def file_mode(full, crel, m):
+        if meta is None: return m & 0o7777
+        mm = meta.mode_of(crel)
+        if mm is not None: return mm
+        try:
+            with open(L(full), 'rb') as f: h = f.read(4)             # sem anotação (arquivo criado depois da extração): executável se for ELF ou script
+        except OSError: h = b''
+        return 0o755 if h[:4] == b'\x7fELF' or h[:2] == b'#!' else 0o644
+
     def write_file(full, st):
         size = st.st_size
         nblk = (size + BS - 1) // BS
         blocks = img.alloc(nblk) if nblk else []
-        with open(full, 'rb') as f:
+        with open(L(full), 'rb') as f:
             i = 0
             while i < nblk:
                 n = min(nblk - i, 2048)
@@ -167,23 +212,26 @@ def build(root, path, size_mb):
         ib, extra = img.block_ptrs(blocks)
         return size, (nblk + len(extra)) * (BS // 512), ib
 
-    def walk(dirpath, ino_dir, parent_ino):
+    def walk(dirpath, ino_dir, parent_ino, rel=''):
         ents = [('.', ino_dir, 2), ('..', parent_ino, 2)]
         subdirs = 0
-        for name in sorted(os.listdir(dirpath)):
-            full = os.path.join(dirpath, name)
-            st = os.lstat(full); m = st.st_mode
+        names = os.listdir(L(dirpath)); vlinks = {}
+        if meta is not None:                                 # Windows: junta os symlinks do sidecar ao que está no disco (o sidecar vale mais que um arquivo de mesmo nome)
+            vlinks = meta.links_in(rel)
+            names = [n for n in names if n not in vlinks and not (rel == '' and n == rootmeta.META)]
+        for name in sorted(set(names) | set(vlinks)):
+            full = os.path.join(dirpath, name); crel = (rel + '/' + name) if rel else name
+            if name in vlinks:
+                if len(name.encode()) > 255: print('nome longo demais, ignorado:', full); continue
+                ino = img.new_inode(); put_symlink(ino, vlinks[name].encode(), time.time()); ents.append((name, ino, 7)); continue
+            st = os.lstat(L(full)); m = st.st_mode
             if len(name.encode()) > 255: print('nome longo demais, ignorado:', full); continue
             if stat.S_ISDIR(m):
                 ino = img.new_inode(True); subdirs += 1
-                walk(full, ino, ino_dir); ents.append((name, ino, 2))
+                walk(full, ino, ino_dir, crel); ents.append((name, ino, 2))
             elif stat.S_ISLNK(m):
                 tgt = os.readlink(full).encode(); ino = img.new_inode()
-                if len(tgt) <= 59:
-                    img.put_inode(ino, stat.S_IFLNK | 0o777, len(tgt), 0, tgt.ljust(60, b'\0'), 1, st.st_mtime)
-                else:
-                    b = img.alloc(1)[0]; img.f.seek(b * BS); img.f.write(tgt.ljust(BS, b'\0'))
-                    ib, _ = img.block_ptrs([b]); img.put_inode(ino, stat.S_IFLNK | 0o777, len(tgt), BS // 512, ib, 1, st.st_mtime)
+                put_symlink(ino, tgt, st.st_mtime)
                 ents.append((name, ino, 7))
             elif stat.S_ISREG(m):
                 key = (st.st_dev, st.st_ino)
@@ -192,7 +240,7 @@ def build(root, path, size_mb):
                 else:
                     ino = img.new_inode(); size, n512, ib = write_file(full, st)
                     ino_of[key] = ino; links[ino] = 1; total[0] += size
-                    img.put_inode(ino, stat.S_IFREG | (m & 0o7777), size, n512, ib, 1, st.st_mtime)
+                    img.put_inode(ino, stat.S_IFREG | file_mode(full, crel, m), size, n512, ib, 1, st.st_mtime)
                 ents.append((name, ino, 1))
             # outros tipos (dispositivos, fifos) ficam de fora: o devtmpfs cria os /dev
         # grava o diretório
@@ -216,8 +264,8 @@ def build(root, path, size_mb):
         blks = img.alloc(len(blocks_data))
         img.write_blocks(blks, b''.join(bytes(b) for b in blocks_data))
         ib, extra = img.block_ptrs(blks)
-        st = os.lstat(dirpath)
-        img.put_inode(ino_dir, stat.S_IFDIR | (st.st_mode & 0o7777), len(blocks_data) * BS, (len(blks) + len(extra)) * (BS // 512), ib, 2 + subdirs, st.st_mtime)
+        st = os.lstat(L(dirpath))
+        img.put_inode(ino_dir, stat.S_IFDIR | ((st.st_mode & 0o7777) if meta is None else 0o755),len(blocks_data) * BS, (len(blks) + len(extra)) * (BS // 512), ib, 2 + subdirs, st.st_mtime)
 
     img.dirs[0] += 1
     img._iset(0, 1)                                  # inode 2 (raiz): já contado entre os 10 reservados

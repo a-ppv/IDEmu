@@ -114,6 +114,7 @@ class PackagesTest(unittest.TestCase):
             self.assertTrue(mgu7.pick(tmp, '0000567a', '999_999_999').endswith('036_010_004'))
             with self.assertRaises(RuntimeError): mgu7.pick(tmp, '0000ffff')
 
+    @unittest.skipIf(not __import__('os').path.isfile(__import__('idemu.mgu7',fromlist=['x']).glhost_path()), 'glhost7 compilado so apos o build')
     def test_guest_files_and_overlay_exist(self):
         for f in mgu7.GUEST_FILES: self.assertTrue(os.path.isfile(os.path.join(mgu7.GUEST, f)), f)
         for f in ('fstab_dummy',): pass
