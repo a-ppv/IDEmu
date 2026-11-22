@@ -25,10 +25,10 @@ These are suggestions taken from how the emulator is built and from the Windows 
 | | macOS | Windows |
 |---|---|---|
 | **OS** | macOS 14 or later | Windows 10 (1803+) or 11, 64-bit |
-| **CPU** | Apple Silicon (M1 or newer); Intel Macs are not supported by the packaged build | 64-bit x86 with 4 or more cores (the VMs run in software emulation) |
+| **CPU** | Apple Silicon: M1 minimum, M2 Pro / M3 or newer recommended (Intel Macs are not supported by the packaged build) | 64-bit x86, 4+ cores: minimum Intel Core i5-8400 or AMD Ryzen 5 2600; recommended Core i7-12700 / Ryzen 7 5800X or better (the VMs run in software emulation, single-core speed matters) |
 | **RAM** | 8 GB for iDrive 5/6 and CIC; 16 GB for iDrive 7 and 8 | 8 GB for iDrive 5/6 and CIC; 16 GB plus a large page file for iDrive 7; **32 GB recommended for iDrive 8** (it commits 12 GiB) |
 | **Disk (free)** | 20 GB (images and environments are built from your own firmware) | 20 GB, on an SSD; exclude the IDEmu folder from Defender for iDrive 7 |
-| **Graphics** | Any Mac GPU (Metal) | A GPU driver with OpenGL (4.1 core for iDrive 7); iDrive 8 also needs Edge or Chrome for ANGLE |
+| **GPU** | The built-in Apple GPU (Metal) is enough; nothing to install | Minimum NVIDIA GTX 1050 Ti or AMD RX 570 (OpenGL 4.1 core driver required for iDrive 7); recommended GTX 1660 / RX 6600 or newer. Integrated Intel UHD 630 works for iDrive 5/6 and CIC only. iDrive 8 also needs Edge or Chrome for ANGLE. VMs and Remote Desktop have no OpenGL |
 | **Other** | Python 3 and the Homebrew libraries listed above | Nothing else: Python is bundled in the zip |
 | **Speed** | iDrive 8 runs near native speed (HVF) | iDrive 8 runs in TCG: minutes to boot and a slow interface; iDrive 5/6 boots in ~25-45 s |
 
